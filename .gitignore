@@ -1,0 +1,8 @@
+.venv/
+.env
+*.png
+*.jpg
+Dockerfile
+*.json
+.cursor/
+.continue/

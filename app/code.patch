@@ -1,0 +1,303 @@
+--- a/bot.py
++++ b/bot.py
+@@ -10,19 +10,6 @@
+ import logging
+ from google.cloud import vision
+ 
+-# --- DIAGNOSTICS FOR MISTRALAI ---
+-import sys
+-# print(f"[MISTRAL_DIAG] Python version: {sys.version}") # УДАЛЯЕМ
+-# try: # УДАЛЯЕМ
+-#     import mistralai # УДАЛЯЕМ
+-#     print(f"[MISTRAL_DIAG] MistralAI library version: {mistralai.__version__}") # УДАЛЯЕМ
+-#     print(f"[MISTRAL_DIAG] MistralAI library path: {mistralai.__file__}") # УДАЛЯЕМ
+-#     print(f"[MISTRAL_DIAG] dir(mistralai): {dir(mistralai)}") # УДАЛЯЕМ
+-#     if hasattr(mistralai, 'models'): # УДАЛЯЕМ
+-#         print(f"[MISTRAL_DIAG] dir(mistralai.models): {dir(mistralai.models)}") # УДАЛЯЕМ
+-#         if hasattr(mistralai.models, 'chat_completion'): # УДАЛЯЕМ
+-#             print(f"[MISTRAL_DIAG] dir(mistralai.models.chat_completion): {dir(mistralai.models.chat_completion)}") # УДАЛЯЕМ
+-#         else: # УДАЛЯЕМ
+-#             print("[MISTRAL_DIAG] mistralai.models.chat_completion NOT FOUND") # УДАЛЯЕМ
+-#     else: # УДАЛЯЕМ
+-#         print("[MISTRAL_DIAG] mistralai.models NOT FOUND") # УДАЛЯЕМ
+-# except ImportError as e_import: # УДАЛЯЕМ
+-#     print(f"[MISTRAL_DIAG] FAILED to import mistralai: {e_import}") # УДАЛЯЕМ
+-# except Exception as e_diag: # УДАЛЯЕМ
+-#     print(f"[MISTRAL_DIAG] Error during mistralai diagnostics: {e_diag}") # УДАЛЯЕМ
+-# --- END DIAGNOSTICS ---
+-
+-# Добавляем необходимые импорты для Mistral AI API
+-import base64
+-from mistralai import Mistral  # Для mistralai==1.5.2 vision через chat
+-
+ # Добавляю импорт для Optional
+ from typing import Optional, Tuple, List, Any
+ 
+@@ -43,7 +30,7 @@
+         return
+ 
+ # --- НАСТРОЙКИ OCR И ОТЛАДКИ ---
+-OCR_PROVIDER = "tesseract"  # Возможные значения: "google", "mistral"
+-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY") # Установите переменную окружения MISTRAL_API_KEY
++OCR_PROVIDER = "tesseract"  # Возможные значения: "google", "tesseract"
+ 
+ DEBUG_LOGGING_ENABLED = True  # Управляет отправкой отладочных сообщений в Telegram
+ # ------------------------
+@@ -69,28 +56,9 @@
+     print("[WARNING] GOOGLE_APPLICATION_CREDENTIALS не установлен или файл не найден. Google Vision будет недоступен.")
+     vision_client = None
+ 
+-# Инициализируем клиента Mistral AI (если ключ есть и OCR_PROVIDER='mistral')
+-mistral_client = None
+-if OCR_PROVIDER == "mistral":
+-    if MISTRAL_API_KEY:
+-        try:
+-            mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+-            telegram_log("[INFO] Mistral AI client initialized.", is_debug_message=True)
+-            print("[INFO] Mistral AI client initialized.")
+-        except Exception as e_mistral_init:
+-            telegram_log(f"[CRITICAL_ERROR] Не удалось инициализировать Mistral AI client: {e_mistral_init}. Бот завершает работу.", is_debug_message=False)
+-            print(f"[CRITICAL_ERROR] Не удалось инициализировать Mistral AI client: {e_mistral_init}. Бот завершает работу.")
+-            import sys
+-            sys.exit(1)
+-    else:
+-        telegram_log("[CRITICAL_ERROR] MISTRAL_API_KEY не установлен, бот завершает работу.", is_debug_message=False)
+-        print("[CRITICAL_ERROR] MISTRAL_API_KEY не установлен, бот завершает работу.")
+-        import sys
+-        sys.exit(1)
+-
+ # Проверяем, что хотя бы один OCR клиент доступен, если нет, то это критично
+ if OCR_PROVIDER == "google" and not vision_client:
+     print(f"[CRITICAL_ERROR] OCR_PROVIDER is 'google', but Google Vision client is not initialized. OCR will not work.")
+     telegram_log("[CRITICAL_ERROR] OCR (Google) недоступен: клиент не инициализирован.", is_debug_message=False)
+     # Можно добавить sys.exit(1) или другую логику аварийного завершения, если OCR критичен
+ 
+-if OCR_PROVIDER == "mistral" and not mistral_client: # Эта проверка дублируется выше, но оставим для явности
+-    print(f"[CRITICAL_ERROR] OCR_PROVIDER is 'mistral', but Mistral OCR client is not initialized. OCR will not work.")
+-    telegram_log("[CRITICAL_ERROR] OCR (Mistral) недоступен: клиент не инициализирован.", is_debug_message=False)
+-    # Можно добавить sys.exit(1)
+     
+ def preprocess_for_tesseract(pil_image: Image.Image) -> Image.Image:
+     """Предобработка изображения для Tesseract OCR"""
+@@ -165,36 +133,6 @@
+         telegram_log(error_msg, is_debug_message=True)
+         return "", [] # Возвращаем пустые значения при любом исключительном событии
+ 
+-def extract_text_mistral_ocr(pil_image: Image.Image) -> Tuple[str, List[List[Any]]]:
+-    """
+-    Использует vision через chat completion (mistralai==1.5.2) для распознавания текста с изображения.
+-    Возвращает полный текст и пустой список блоков (bounding box не поддерживается).
+-    """
+-    if not mistral_client:
+-        telegram_log("[ERROR_MISTRAL_OCR] Mistral client is not initialized.", is_debug_message=True)
+-        return "", []
+-
+-    try:
+-        telegram_log("[DEBUG_MISTRAL_API] Attempting Mistral OCR (chat vision)...", is_debug_message=True)
+-        buf = io.BytesIO()
+-        pil_image.save(buf, format="PNG")
+-        img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+-        image_data_url = f"data:image/png;base64,{img_base64}"
+-        messages = [
+-            {
+-                "role": "user",
+-                "content": [
+-                    {"type": "text", "text": "Extract all text from this image. Preserve line breaks."},
+-                    {"type": "image_url", "image_url": image_data_url}
+-                ]
+-            }
+-        ]
+-        response = mistral_client.chat.complete(
+-            model="mistral-small-latest",
+-            messages=messages,
+-        )
+-        if response.choices and response.choices[0].message:
+-            full_text = response.choices[0].message.content.strip()
+-            telegram_log(f"[DEBUG_MISTRAL_API] Mistral OCR successful. Text length: {len(full_text)}", is_debug_message=True)
+-            return full_text, []
+-        else:
+-            telegram_log("[ERROR_MISTRAL_API] Mistral OCR returned no content.", is_debug_message=True)
+-            return "", []
+-    except Exception as e:
+-        error_msg = f"Exception in extract_text_mistral_ocr (chat vision): {e}"
+-        logging.exception(error_msg)
+-        telegram_log(error_msg, is_debug_message=True)
+-        return "", []
+-
+ def extract_text_tesseract(pil_image: Image.Image) -> Tuple[str, List[List[Any]]]:
+     """Использует Tesseract OCR с предобработкой"""
+     try:
+@@ -231,14 +169,11 @@
+     Но теперь поддерживает: google, mistral, tesseract.
+     """
+     if OCR_PROVIDER == "mistral" and mistral_client:
+-        print("[INFO_OCR] Using Mistral OCR.")
+-        return extract_text_mistral_ocr(pil_image)
++        # This branch is effectively dead code after removing mistral_client init
++        pass 
+     elif OCR_PROVIDER == "google" and vision_client:
+         print("[INFO_OCR] Using Google Vision OCR.")
+         return extract_text_google_vision(pil_image)
+     elif OCR_PROVIDER == "tesseract":
+         print("[INFO_OCR] Using Tesseract OCR.")
+         return extract_text_tesseract(pil_image)
+-    elif OCR_PROVIDER == "mistral" and not mistral_client and vision_client:
+-        print("[WARNING_OCR] OCR_PROVIDER set to mistral but client not available, falling back to Google Vision.")
+-        return extract_text_google_vision(pil_image)
+-    elif OCR_PROVIDER == "google" and not vision_client and mistral_client:
+-        print("[WARNING_OCR] OCR_PROVIDER set to google but client not available, falling back to Mistral.")
+-        return extract_text_mistral_ocr(pil_image)
+     else:
+         print("[ERROR_OCR] No OCR provider is available or initialized correctly.")
+         return "", []
+@@ -910,31 +745,19 @@
+             # --- Конец добавления --- 
+             return False
+     # --- Гибридный режим для фор ---
+-    elif ("фора" in outcome.lower() or "победа с учетом форы" in outcome.lower()):
+-        # Гибридный режим только если явно выбран Mistral и клиент инициализирован
+-        if OCR_PROVIDER == "mistral" and mistral_client:
+-            telegram_log(f"[HYBRID_FOR] Использую гибридный режим (Mistral+Tesseract) для исхода: '{outcome}'", is_debug_message=True)
+-            x1, y1, x2, y2 = OUTCOME_SEARCH_REGION
+-            region_width = x2 - x1
+-            region_height = y2 - y1
+-            screenshot = pyautogui.screenshot(region=(x1, y1, region_width, region_height))
+-            search_text = outcome.strip()
+-            if find_handicap_hybrid_click_new(screenshot, search_text):
+-                time.sleep(2)
+-                home_coords = (70, 142)
+-                telegram_log(f"[HYBRID_FOR] Клик по 'домой' ({{home_coords}}) СРАЗУ ПОСЛЕ выбора исхода '{{outcome}}'.", is_debug_message=True)
+-                pyautogui.click(home_coords[0], home_coords[1])
+-                time.sleep(5)
+-                found_coef_first = None
+-            else:
+-                telegram_log("[HYBRID_FOR][ERROR] Фора не найдена гибридным методом! Пробую fallback на обычный поиск.")
+-                # Fallback на обычную функцию ниже
+-        # Если не Mistral или клиент не инициализирован — всегда fallback на обычную функцию
+-        else:
+-            telegram_log(f"[HYBRID_FOR][FALLBACK] Использую обычный поиск форы через выбранный OCR-провайдер: {OCR_PROVIDER}", is_debug_message=True)
++    # Убрана ветка для гибридного режима, так как Mistral OCR удален.
++    # Теперь любая фора, не попавшая в предыдущий elif "фора" (что маловероятно),
++    # будет обрабатываться как обычная фора.
++    # ЭТОТ БЛОК БЫЛ `elif ("фора" in outcome.lower() or "победа с учетом форы" in outcome.lower()):`
++    # Он будет удален, т.к. предыдущий `elif "фора"` уже обрабатывает все случаи.
++    # В случае, если `OCR_PROVIDER` был Mistral и произошел fallback, это также не актуально.
++    # Если есть какая-то очень специфичная фора, не обработанная предыдущим блоком,
++    # она пойдет в общий поиск `optimized_search_for_outcome`.
++    # Лучше удостовериться, что `elif "фора" in outcome.lower():` покрывает все нужные случаи.
++    # Предполагаем, что `find_handicap_outcome_new` достаточно универсальна.
++    # Если же "победа с учетом форы" является отдельным классом, то нужно было бы добавить отдельный elif.
++    # Пока что, если этот блок был только для гибридного режима Mistral, его можно удалить.
++    #
++    # Если данный `elif` блок был предназначен для других типов фор помимо `фора`,
++    # то его логику следует перенести в `elif "фора" in outcome.lower():`
++    # или создать отдельный `elif` для "победа с учетом форы" без Mistral.
++    #
++    # Текущий diff предполагает, что этот `elif` полностью удаляется.
++    # Если нужен отдельный `elif` для "победа с учетом форы", его надо добавить явно.
++    # В данном случае, из-за наличия `elif "фора" in outcome.lower():` выше,
++    # эта `elif` ветка с гибридным режимом была избыточна или специфична для Mistral.
++    # Если она все же нужна для "победа с учетом форы" (без "фора"), то ее надо переформулировать.
++    # Если "победа с учетом форы" всегда содержит "фора", то ветка выше ее покроет.
++    # Принято решение удалить этот `elif` целиком.
++    pass # Заглушка, чтобы не нарушать синтаксис `elif` цепочки
++    
++    # НАЧИНАЕТСЯ БЛОК, КОТОРЫЙ БЫЛ ВНУТРИ УДАЛЕННОГО `else` (FALLBACK)
++    # Этот код будет исполняться для всех оставшихся случаев, включая "фора" если она не сработала выше,
++    # или другие исходы, не попавшие в предыдущие специфические `elif`
++    
+         # Обычный поиск форы через выбранный OCR
+         screenshot = pyautogui.screenshot(region=OUTCOME_SEARCH_REGION)
+         full_text, ocr_blocks = get_ocr_results(screenshot)
+@@ -951,7 +874,7 @@
+             time.sleep(3)
+             # --- Конец добавления --- 
+             return False
+-    else:
++    else: # Это `else` соответствует самому первому `if` для `outcome in PREDEFINED_OUTCOME_COORDS`
+         # 7. Ищем исход
+         outcome = outcome.strip()
+         found_coords, recognized_outcome_text = optimized_search_for_outcome(
+@@ -1341,40 +1264,6 @@
+     for chat_id in subscribers:
+         send_message(chat_id, msg[:4000])
+ 
+-def test_google_vision_ocr(image_path: str = "2025-04-25-221623_752x490_scrot.png"):
+-    """
+-    Тестирует работу Google Vision OCR на заданном изображении.
+-    Отправляет результат (full_text и блоки) в Telegram.
+-    """
+-    from PIL import Image
+-    try:
+-        img = Image.open(image_path)
+-    except Exception as e:
+-        telegram_log(f"[TEST_OCR] Не удалось открыть изображение {image_path}: {e}")
+-        return
+-    telegram_log(f"[TEST_OCR] Запуск теста Google Vision OCR для файла: {image_path}")
+-    full_text, blocks = extract_text_google_vision(img)
+-    msg = f"[TEST_OCR] Результат Google Vision OCR для {image_path}:\nFull text:\n{full_text}\n\nBlocks (первые 10):\n" + "\n".join([str(b) for b in blocks[:10]])
+-    if len(blocks) > 10:
+-        msg += f"\n... (ещё {len(blocks)-10} блоков)"
+-    for chat_id in subscribers:
+-        send_message(chat_id, msg[:4000])
+-
+-def find_handicap_hybrid_click_new(pil_image: Image.Image, search_text: str) -> bool:
+-    """
+-    Гибридный поиск и клик по форe:
+-    1. Распознаёт текст через Mistral, ищет search_text (например, 'Брайтон энд Хоув Альбион (+2.0)').
+-    2. Если найден — распознаёт через Tesseract, ищет этот же текст (или его часть) в блоках.
+-    3. Кликает по координатам найденного блока.
+-    Проблемы и обходы:
+-    - Если Tesseract даёт транслит или ошибки, ищем по числу форы (например, '(+2.0)').
+-    - Подробно логируем этапы.
+-    """
+-    # 1. Mistral: ищем нужный текст
+-    full_text_mistral, _ = extract_text_mistral_ocr(pil_image)
+-    if search_text.lower() not in full_text_mistral.lower():
+-        telegram_log(f"[HYBRID_FOR] '{search_text}' не найден через Mistral OCR.")
+-        return False
+-    telegram_log(f"[HYBRID_FOR] '{search_text}' найден через Mistral OCR. Ищем координаты через Tesseract...")
+-
+-    # 2. Tesseract: ищем bounding box
+-    _, tesseract_blocks = extract_text_tesseract(pil_image)
+-    # Сначала ищем полное совпадение
+-    for block in tesseract_blocks:
+-        block_text_clean = block[1].lower().strip()
+-        search_text_clean = search_text.lower().strip()
+-        if search_text_clean in block_text_clean or \
+-           any(re.search(rf'\b{re.escape(search_text_clean)}\b', block_text_clean, re.IGNORECASE) for tool in [1]):
+-            x_click = min(v[0] for v in block[0])
+-            y_click = min(v[1] for v in block[0])
+-            pyautogui.click(x_click, y_click)
+-            telegram_log(f"[HYBRID_FOR] Клик по '{block[1]}' через Tesseract на ({x_click}, {y_click})")
+-            return True
+-    # Если не нашли — ищем по числу форы (например, '(+2.0)')
+-    m = re.search(r'\([-+]?\d+(?:\.\d+)?\)', search_text)
+-    if not m:  # Try Cyrillic pattern
+-        m = re.search(r'$$[+-]?\d+[.,]?\d*$$', search_text)
+-    if m:
+-        handicap_val = m.group(0)
+-        for block in tesseract_blocks:
+-            if handicap_val in block[1]:
+-                x_click = min(v[0] for v in block[0])
+-                y_click = min(v[1] for v in block[0])
+-                pyautogui.click(x_click, y_click)
+-                telegram_log(f"[HYBRID_FOR] Клик по блоку с форой '{block[1]}' (по числу {handicap_val}) через Tesseract на ({x_click}, {y_click})")
+-                return True
+-    telegram_log(f"[HYBRID_FOR] '{search_text}' не найден в блоках Tesseract.")
+-    return False
+-
+ def main():
+     """
+     Точка входа: 
+@@ -1405,10 +1294,6 @@
+     do_login()
+     time.sleep(5)
+ 
+-    # Просто ждём, пока в другом потоке poll_updates обрабатывает сообщения
+-    while True:
+-        time.sleep(1)
+-
+     # --- ДОБАВЛЕНО: тест Google Vision OCR ---
+     test_google_vision_ocr()  # Можно указать другой путь к картинке
+ 

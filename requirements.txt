@@ -1,0 +1,9 @@
+mistralai==1.5.2
+pydantic>=2.0.0 # Требуется для mistralai
+requests
+pyautogui
+opencv-python
+numpy
+Pillow
+pytesseract
+pyperclip
