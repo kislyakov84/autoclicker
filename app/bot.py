@@ -14,7 +14,7 @@ import logging
 
 import base64
 from mistralai import Mistral
-#from mistralai.models.chat import TextChunk # Import TextChunk - ВОССТАНОВЛЕНО
+#from mistralai.models.chat import TextChunk # ВОССТАНОВЛЕНО: УБРАН КОММЕНТАРИЙ
 
 from typing import Optional, Tuple, List, Any, Dict
 
@@ -173,10 +173,18 @@ def extract_text_mistral_ocr(pil_image: Image.Image) -> Tuple[str, List[List[Any
                 if isinstance(content_result, list) and content_result:
                     all_text_chunks = []
                     for chunk in content_result:
-                        if isinstance(chunk, TextChunk): # Проверяем, является ли блок текстовым
-                            all_text_chunks.append(chunk.text.strip())
-                        elif isinstance(chunk, str): # Fallback for older versions or different content types
-                            all_text_chunks.append(chunk.strip())
+                        # Ensure TextChunk is imported for this check
+                        try:
+                            # Safely import TextChunk only when needed, to avoid breaking if it's not present
+                            # or if mistralai version is older.
+                            from mistralai.models.chat import TextChunk
+                            if isinstance(chunk, TextChunk): # Проверяем, является ли блок текстовым
+                                all_text_chunks.append(chunk.text.strip())
+                            elif isinstance(chunk, str): # Fallback for older versions or different content types
+                                all_text_chunks.append(chunk.strip())
+                        except ImportError: # If TextChunk not imported, treat as string
+                            if isinstance(chunk, str):
+                                all_text_chunks.append(chunk.strip())
                     full_text = "\n".join(all_text_chunks) # Объединяем все текстовые фрагменты
                 elif isinstance(content_result, str):
                     full_text = content_result.strip()
@@ -713,7 +721,7 @@ def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]]
     Находит и кликает по исходу форы в данном наборе OCR-блоков.
     Tesseract здесь фокусируется только на поиске конкретного значения форы и коэффициента.
     Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота.
-    Добавлена логика привязки к имени команды.
+    # Удалено из docstring: Добавлена логика привязки к имени команды.
     """
 
     handicap_match = re.search(r'(\(([-+]?\d+(?:\.\d+)?)\))', target_outcome)
@@ -721,42 +729,73 @@ def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]]
         telegram_log(f"[HANDICAP_CLICK_HELPER] Не удалось извлечь значение форы из target_outcome: {target_outcome}", is_debug_message=True)
         return False
 
-    handicap_display_str = handicap_match.group(1).strip()
-    handicap_value_float = float(handicap_match.group(2))
-    handicap_value_abs_str = str(abs(handicap_value_float))
+    handicap_display_str = handicap_match.group(1).strip() # e.g., "(-1.0)"
+    handicap_value_float = float(handicap_match.group(2)) # e.g., -1.0
+    handicap_value_float_str = handicap_match.group(2).strip() # e.g., "-1.0"
+    handicap_value_abs_str = str(abs(handicap_value_float)) # e.g., "1.0"
 
     telegram_log(f"[HANDICAP_CLICK_HELPER] Tesseract ищет: Value='{handicap_value_float}' (Display='{handicap_display_str}')", is_debug_message=True)
 
-    Y_LINE_TOLERANCE_COEF = 15 # Для выравнивания коэффициента (горизонтально)
+    Y_LINE_TOLERANCE_COEF = 15
     X_COEF_SEARCH_RANGE = 300
-    # Y_TEAM_ASSOC_MAX_DIST_PX = 70 # Эта константа больше не используется в этом месте
+
+    # Define a character mapping for common OCR errors (simplified)
+    # This map allows for typical misinterpretations by Tesseract
+    OCR_CHAR_MAP = {
+        '0': '[0o]', '1': '[1l]', '2': '[2z]', '3': '[3]', '4': '[4]',
+        '5': '[5s]', '6': '[6]', '7': '[7]', '8': '[8]', '9': '[9]',
+        '-': '[—\-a]', # Hyphen, em-dash, or 'a' (common for minus sign)
+        '.': '[\.,]', # Dot or comma
+        '(': '[\(]',
+        ')': '[\)]',
+        '+': '[\+]',
+    }
+
+    def create_flexible_pattern(input_string):
+        """Creates a regex pattern from a string, allowing for common OCR errors and optional spaces."""
+        pattern_chars = []
+        for char in input_string.lower().replace(' ', ''): # Normalize input string (remove spaces, convert to lower)
+            pattern_chars.append(OCR_CHAR_MAP.get(char, re.escape(char))) # Use map or escape if not in map
+        return '(?:\s*' + ''.join(pattern_chars) + '\s*)' # Allow optional spaces around the full pattern
+
+    # Convert the target display string and numeric value into flexible regex patterns for Tesseract's output.
+    flexible_display_pattern = create_flexible_pattern(handicap_display_str) # e.g., "(-1.5)" -> "[\(\s]*[—\-a]?1[\.,]5[\)\s]*"
+    flexible_numeric_value_pattern = create_flexible_pattern(handicap_value_float_str) # e.g., "-1.5" -> "[—\-a]?1[\.,]5"
+    flexible_abs_numeric_pattern = create_flexible_pattern(handicap_value_abs_str) # e.g., "1.5" -> "1[\.,]5"
+
 
     potential_handicap_blocks = []
     for idx, block in enumerate(ocr_blocks):
-        block_text_normalized = block[1].replace(' ', '').replace(',', '.')
+        block_text = block[1] # Original text from Tesseract
+        # Aggressively clean Tesseract's block text for matching
+        # Remove all whitespace, and replace commas with dots, and em-dashes with hyphens
+        block_text_cleaned_for_match = block_text.lower().replace(' ', '').replace(',', '.').replace('—', '-')
+
         is_handicap_value_matched = False
 
-        if handicap_display_str.replace(' ', '') in block_text_normalized:
+        # Try matching the full display string (e.g., "(-1.5)") with flexibility
+        if re.search(flexible_display_pattern, block_text_cleaned_for_match):
             is_handicap_value_matched = True
-            # telegram_log(f"[DEBUG_CLICK_HELPER] Exact display string matched: '{handicap_display_str}' in '{block_text_normalized}'", is_debug_message=True)
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible display pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_display_str}'", is_debug_message=True)
+        # Try matching just the numeric value (e.g., "-1.5") with flexibility
+        elif re.search(flexible_numeric_value_pattern, block_text_cleaned_for_match):
+            is_handicap_value_matched = True
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible numeric value pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_value_float_str}'", is_debug_message=True)
+        # Try matching just the absolute numeric value (e.g., "1.5"), might miss sign or parentheses, with flexibility
+        elif re.search(flexible_abs_numeric_pattern, block_text_cleaned_for_match):
+            is_handicap_value_matched = True
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible absolute numeric pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_value_abs_str}'", is_debug_message=True)
         else:
-            handicap_numeric_pattern = r'[-+]?' + re.escape(handicap_value_abs_str.replace('.', '\.')) + r'(?:\.\d+)?'
-            if re.search(handicap_numeric_pattern, block_text_normalized):
-                if re.search(r'[\(]?' + handicap_numeric_pattern + r'[\)]?', block_text_normalized) or \
-                   re.match(r'^\s*' + handicap_numeric_pattern + r'\s*$', block_text_normalized):
-                    is_handicap_value_matched = True
-                    # telegram_log(f"[DEBUG_CLICK_HELPER] Flexible regex matched for value: '{handicap_value_abs_str}' in '{block_text_normalized}'", is_debug_message=True)
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract did NOT match: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') with any handicap patterns for '{handicap_display_str}'", is_debug_message=True)
+
 
         if is_handicap_value_matched:
-            # *УДАЛЕНО*: Строгая проверка близости имени команды здесь.
-            # Вместо этого, мы полагаемся на то, что Mistral OCR уже подтвердил наличие команды
-            # в общей области скриншота в find_handicap_hybrid_click_new.
             potential_handicap_blocks.append(block)
-            telegram_log(f"[HANDICAP_CLICK_HELPER] Найден ПОТЕНЦИАЛЬНЫЙ целевой блок форы: '{block[1]}'.", is_debug_message=True)
+            telegram_log(f"[HANDICAP_CLICK_HELPER] Найден ПОТЕНЦИАЛЬНЫЙ целевой блок форы: '{block_text}'.", is_debug_message=True)
 
 
     if not potential_handicap_blocks:
-        telegram_log(f"[HANDICAP_CLICK_HELPER] Потенциальные блоки форы для '{handicap_display_str}' (с командой, если применимо) не найдены.", is_debug_message=True)
+        telegram_log(f"[HANDICAP_CLICK_HELPER] Потенциальные блоки форы для '{handicap_display_str}' не найдены Tesseract'ом.", is_debug_message=True)
         return False
 
     # Теперь из потенциальных блоков форы находим соответствующий коэффициент и кликаем
@@ -771,33 +810,31 @@ def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]]
         text_in_block_normalized = block[1].replace(' ', '').replace(',', '.')
         handicap_text_in_target_outcome_normalized = handicap_display_str.replace(' ', '')
         
-        coef_match_inline = re.search(r'\b(\d+(?:\.\d+)?)$', text_in_block_normalized) # Регулярное выражение для захвата числа в конце строки
+        coef_match_inline = re.search(r'\b(\d+(?:\.\d+)?)$', text_in_block_normalized)
         if coef_match_inline:
-             # Убедимся, что отображение форы находится *перед* коэффициентом в тексте блока
-             handicap_idx_in_block = text_in_block_normalized.find(handicap_text_in_target_outcome_normalized)
-             coef_idx_in_block = text_in_block_normalized.find(coef_match_inline.group(1))
+            handicap_idx_in_block = text_in_block_normalized.find(handicap_text_in_target_outcome_normalized)
+            coef_idx_in_block = text_in_block_normalized.find(coef_match_inline.group(1))
 
-             if handicap_idx_in_block != -1 and coef_idx_in_block != -1 and coef_idx_in_block > handicap_idx_in_block:
+            if handicap_idx_in_block != -1 and coef_idx_in_block != -1 and coef_idx_in_block > handicap_idx_in_block:
                 coef_text = coef_match_inline.group(1)
-                block_center_x = x_block + block_width / 2 # Кликаем по самому блоку форы
+                block_center_x = x_block + block_width / 2
                 block_center_y = y_block + block_height / 2
                 
                 pyautogui.click(int(block_center_x) + region_offset_x, int(block_center_y) + region_offset_y)
                 telegram_log(f"[HANDICAP_CLICK_HELPER][INLINE_COEF] Кликнута фора '{block[1]}' со встроенным коэф. '{coef_text}' по ({int(block_center_x) + region_offset_x}, {int(block_center_y) + region_offset_y}).", is_debug_message=True)
+                time.sleep(0.5) # Добавлена задержка
                 return True
 
         # 2. Попытка найти коэффициент в соседних блоках
-        # Итерируем по блокам после текущего блока форы
         for j in range(ocr_blocks.index(block) + 1, len(ocr_blocks)):
             next_block = ocr_blocks[j]
             x_next_block, y_next_block = next_block[0][0][0], next_block[0][0][1]
 
-            # Проверяем вертикальное выравнивание (та же строка) и горизонтальную близость
             if abs(y_next_block - y_block) < Y_LINE_TOLERANCE_COEF and \
                x_next_block > x_block and \
                (x_next_block - (x_block + block_width)) < X_COEF_SEARCH_RANGE:
                 
-                if re.match(r'^\d+(?:\.\d+)?$', next_block[1].replace(',', '.')): # Проверяем, является ли следующий блок числом (коэффициентом)
+                if re.match(r'^\d+(?:\.\d+)?$', next_block[1].replace(',', '.')):
                     coef_block_width = next_block[0][1][0] - next_block[0][0][0]
                     coef_block_height = next_block[0][2][1] - next_block[0][0][1]
 
@@ -806,15 +843,14 @@ def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]]
                     
                     pyautogui.click(int(coef_block_center_x) + region_offset_x, int(coef_block_center_y) + region_offset_y)
                     telegram_log(f"[HANDICAP_CLICK_HELPER][ADJ_COEF] Кликнута фора '{block[1]}' с соседним коэф. '{next_block[1]}' по ({int(coef_block_center_x) + region_offset_x}, {int(coef_block_center_y) + region_offset_y}).", is_debug_message=True)
+                    time.sleep(0.5) # Добавлена задержка
                     return True
                 else:
                     telegram_log(f"[HANDICAP_CLICK_HELPER][DEBUG] Блок '{next_block[1]}' горизонтально близко, но не является коэффициентом. (dx={x_next_block - (x_block + block_width)}).", is_debug_message=True)
-            # Если следующий блок слишком далеко вертикально или горизонтально, прерываем поиск соседнего коэффициента для этого блока форы
-            elif y_next_block - y_block > Y_LINE_TOLERANCE_COEF * 2: # Значительный вертикальный скачок
+            elif y_next_block - y_block > Y_LINE_TOLERANCE_COEF * 2:
                 break
-            elif x_next_block - (x_block + block_width) > X_COEF_SEARCH_RANGE: # Слишком далеко горизонтально
+            elif x_next_block - (x_block + block_width) > X_COEF_SEARCH_RANGE:
                 break
-
 
     telegram_log(f"[HANDICAP_CLICK_HELPER] Не удалось найти и кликнуть по исходу для '{target_outcome}' даже после обработки потенциальных блоков. Действующий коэффициент не найден.", is_debug_message=True)
     return False
@@ -1093,7 +1129,7 @@ def parse_coefficient_from_text(text):
             return None
     return None
 
-def find_bet_input_coords(timeout=15, color_tolerance_ready=15, color_tolerance_white=5):
+def find_bet_input_coords(timeout=15, color_tolerance_ready=20, color_tolerance_white=5): # УВЕЛИЧЕН ДОПУСК color_tolerance_ready до 20
     """
     Ищет координаты поля для ввода суммы ставки ПОСЛЕ перехода на главную.
     1. Ждет появления индикатора готовности (зеленый цвет).
@@ -1101,8 +1137,11 @@ def find_bet_input_coords(timeout=15, color_tolerance_ready=15, color_tolerance_
     Возвращает кортеж (координаты, тип_кандидата) или (None, None).
     Тип кандидата: "primary" или "secondary".
     """
+    # ОБНОВЛЕННЫЕ КООРДИНАТЫ И ЦВЕТА ИНДИКАТОРА ГОТОВНОСТИ (ПОСЛЕ АНАЛИЗА СКРИНШОТОВ)
+    # Если на скриншотах видно, что (1250, 249) все еще не зеленый, то нужно
+    # подобрать новую точку или цвет, либо увеличить таймаут.
     READY_CHECK_COORDS = (1250, 249)
-    TARGET_READY_COLOR = (6, 136, 69)
+    TARGET_READY_COLOR = (6, 136, 69) 
     CHECK_REGION_SIZE = 5
 
     BET_INPUT_PRIMARY = (1199, 319)
@@ -1113,13 +1152,23 @@ def find_bet_input_coords(timeout=15, color_tolerance_ready=15, color_tolerance_
     telegram_log(f"[DEBUG] Ожидание индикатора готовности поля ввода (цвет {TARGET_READY_COLOR} в {READY_CHECK_COORDS})...", is_debug_message=True)
 
     ready_indicator_found = False
+    debug_ss_counter = 0 # Добавляем счетчик для отладочных скриншотов
     while time.time() - start_time < timeout:
         region_ready = (READY_CHECK_COORDS[0], READY_CHECK_COORDS[1], CHECK_REGION_SIZE, CHECK_REGION_SIZE)
         try:
             screenshot_ready = pyautogui.screenshot(region=region_ready)
             stat_ready = ImageStat.Stat(screenshot_ready)
-            avg_color_ready = tuple(int(c) for c in stat_ready.mean)
+            avg_color_ready = tuple(int(c) for c in stat_ready.mean) # Используем средний цвет для устойчивости
+            
             telegram_log(f"[DEBUG] Проверка индикатора готовности: {READY_CHECK_COORDS}, текущий цвет {avg_color_ready}", is_debug_message=True)
+
+            # Отправка отладочного скриншота маленькой области для анализа
+            if DEBUG_SCREENSHOT: # Отправляем только если DEBUG_SCREENSHOT включен
+                debug_ss_counter += 1
+                debug_path_ready = f"debug_ready_check_region_{debug_ss_counter}.png"
+                screenshot_ready.save(debug_path_ready)
+                for chat_id in subscribers:
+                    send_photo(chat_id, debug_path_ready, caption=f"Debug: Ready check region {READY_CHECK_COORDS}, Color: {avg_color_ready}, Iter: {debug_ss_counter}")
 
             if all(abs(avg_color_ready[i] - TARGET_READY_COLOR[i]) <= color_tolerance_ready for i in range(3)):
                 telegram_log(f"[DEBUG] Индикатор готовности найден ({avg_color_ready}). Проверяю белые пиксели...", is_debug_message=True)
@@ -1433,7 +1482,7 @@ def find_halftime_handicap_and_click_new(outcome_str: str, match_name: Optional[
                             return True
                         found_coef = True
                 if not found_coef:
-                    telegram_log(f"[HT_HANDICAP_NEW][SCROLL] Блок с форой {handicap_display_search} найден (начинается с {handicap_display_search}), но кэф не найден ни в этом, ни в следующих 7 блоках. Просмотренные блоки: {checked_blocks}")
+                    telegram_log(f"[HT_HANDICAP_NEW][SCROLL] Блок с форой {handicap_display_search} найден (начинается с {handim_display_search}), но кэф не найден ни в этом, ни в следующих 7 блоках. Просмотренные блоки: {checked_blocks}")
         telegram_log(f"[HT_HANDICAP_NEW][SCROLL] Исход не найден на текущем экране (скролл {scroll_iter+1}).", is_debug_message=True)
         pyautogui.scroll(-4)
         time.sleep(1)
@@ -1938,7 +1987,7 @@ def find_total_coef_candidates_new(total_block, ocr_blocks, base_type, x1_region
     candidates.sort(key=lambda c: c[3])
     if candidates:
         msg = '[TOTAL_NEW][FLEX] Найдены кандидаты коэффициентов рядом с тоталом: '
-        msg += ', '.join([f"{c[0][1]}@({c[1]},{c[2]}) dx={c[3]}" for c in candidates])
+        msg += ', '.join([f"{c[0][1]}@({c[1]},{c[2]})" for c in candidates])
         telegram_log(msg)
     return candidates
 
@@ -2265,25 +2314,28 @@ def find_handicap_hybrid_click_new(search_text: str, match_name: str, max_scroll
     if not handicap_match:
         telegram_log(f"[HYBRID_FOR][ERROR] Не удалось извлечь значение форы из search_text: {search_text}", is_debug_message=True)
         return False
-    handicap_display_from_input = handicap_match.group(1).strip()
-    handicap_value_from_input = handicap_match.group(2).strip()
+    handicap_display_from_input = handicap_match.group(1).strip() # e.g., "(-1.0)"
+    handicap_value_from_input = handicap_match.group(2).strip()  # e.g., "-1.0"
 
     team_name_target = None
-    # Извлекаем имя команды из search_text, сравнивая с командами из match_name
     match_teams = [t.strip().lower() for t in match_name.split('-')]
     for team_part in match_teams:
-        # Проверяем, присутствует ли часть команды из названия матча в строке исхода
         if team_part in search_text.lower():
             team_name_target = team_part
             break
 
-    # Добавляем более гибкий паттерн для поиска числового значения форы в тексте Mistral
-    handicap_value_for_regex = re.escape(handicap_value_from_input.replace('.', r'\.'))
-    # Этот паттерн ищет числовое значение с опциональными скобками и знаками
-    handicap_regex_pattern_full = r'[\(]?[-+]?' + handicap_value_for_regex + r'[\)]?'
-    # Также ищем просто число, так как OCR может опустить скобки и знаки
-    handicap_regex_pattern_bare_number = handicap_value_for_regex
+    # Prepare patterns for matching handicap value from Mistral's output
+    # Get the absolute numeric value (e.g., "1.0" from "-1.0")
+    abs_handicap_value_str = str(abs(float(handicap_value_from_input)))
+    abs_handicap_value_escaped = re.escape(abs_handicap_value_str.replace('.', r'\.'))
 
+    # Pattern for (X.X) or X.X or -X.X or +X.X allowing optional spaces inside/around
+    # This covers `(-1.0)`, `(1.0)`, `1.0`, `-1.0` as well as variations like `( -1.0 )`
+    loose_handicap_value_pattern = re.compile(
+        r'[\(\s]*[-+]?\s*' + abs_handicap_value_escaped + r'\s*[\)\s]*'
+    )
+    # Also consider the exact display string provided, but normalized for matching against cleaned Mistral output
+    handicap_display_normalized_for_search = handicap_display_from_input.lower().replace(" ", "").replace(",", ".")
 
     for scroll_iter in range(max_scrolls):
         telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Делаем скриншот и выполняем OCR.", is_debug_message=True)
@@ -2297,27 +2349,30 @@ def find_handicap_hybrid_click_new(search_text: str, match_name: str, max_scroll
         full_text_mistral, _ = extract_text_mistral_ocr(current_screenshot)
         full_text_mistral_lower = full_text_mistral.lower()
 
-        handicap_type_present_mistral = "форы" in full_text_mistral_lower or "победа с учетом форы" in full_text_mistral_lower
-
-        # Улучшенная проверка наличия значения форы с использованием regex
-        handicap_value_present_mistral = re.search(handicap_regex_pattern_full, full_text_mistral_lower) is not None or \
-                                         re.search(handicap_regex_pattern_bare_number, full_text_mistral_lower) is not None
+        # Clean Mistral's output string for matching
+        full_text_mistral_cleaned_for_match = full_text_mistral_lower.replace(" ", "").replace(",", ".").replace("—", "-")
 
 
-        # Проверяем, присутствует ли имя команды в полном тексте Mistral
+        handicap_type_present_mistral = "форы" in full_text_mistral_cleaned_for_match or \
+                                        "победасучетомфоры" in full_text_mistral_cleaned_for_match
+
+        # Check for handicap value presence using both the exact display string (normalized)
+        # and the more flexible regex pattern for the numerical value.
+        handicap_value_present_mistral = \
+            handicap_display_normalized_for_search in full_text_mistral_cleaned_for_match or \
+            loose_handicap_value_pattern.search(full_text_mistral_cleaned_for_match) is not None
+
         team_present_mistral = False
-        team_name_for_mistral_check = "Н/Д" # По умолчанию для логгирования
+        team_name_for_mistral_check = "Н/Д"
         if team_name_target:
-            if is_fuzzy_match(team_name_target, full_text_mistral_lower):
+            if is_fuzzy_match(team_name_target, full_text_mistral_lower): # Using original lower text for fuzzy match
                 team_present_mistral = True
-                team_name_for_mistral_check = team_name_target # Для логгирования результата Mistral
+                team_name_for_mistral_check = team_name_target
 
         telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Результат Mistral OCR: Тип форы: {handicap_type_present_mistral}, Команда: {team_present_mistral} ('{team_name_for_mistral_check}'), Значение форы: {handicap_value_present_mistral} ('{handicap_display_from_input}').", is_debug_message=True)
 
-        # Условие для запуска Tesseract:
-        # 1. Значение форы найдено Mistral (ключевое).
-        # 2. ИЛИ команда не указана, ИЛИ команда присутствует по Mistral.
-        # 3. И тип форы присутствует (чтобы мы были в правильном разделе).
+        # Условие для запуска Tesseract: Mistral должен подтвердить наличие значения форы,
+        # тип форы, и команды (если указана).
         if handicap_value_present_mistral and (not team_name_target or team_present_mistral) and handicap_type_present_mistral:
             telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Конкретное значение форы '{handicap_display_from_input}' найдено Mistral OCR (и проверка команды/типа пройдена). Переходим к Tesseract для точных координат.", is_debug_message=True)
 
@@ -2330,22 +2385,16 @@ def find_handicap_hybrid_click_new(search_text: str, match_name: str, max_scroll
                 debug_path,
                 full_text_tesseract,
                 tesseract_blocks,
-                found=False, # Этот статус будет обновлен после вызова _click_handicap_from_blocks
+                found=False,
                 extra=f"OCR_PROVIDER: {OCR_PROVIDER}. Match Name: {match_name}. Parsed Team: {team_name_target}. Parsed Handicap: {handicap_display_from_input}"
             )
-            # Передаем извлеченное team_name_target в _click_handicap_from_blocks
             if _click_handicap_from_blocks(search_text, tesseract_blocks, team_name_target, x1_region, y1_region):
                 telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Исход '{search_text}' успешно найден и кликнут Tesseract'ом.", is_debug_message=True)
                 return True
             else:
                 telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Исход '{search_text}' НЕ найден Tesseract'ом на этом экране, несмотря на подтверждение Mistral. Пробуем следующий скролл.", is_debug_message=True)
         else:
-            # Mistral не нашел конкретное значение форы, или проверки команды/типа не прошли
-            telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Условие Mistral не пройдено: "
-                         f"Значение присутствует: {handicap_value_present_mistral}, "
-                         f"Проверка команды: {not team_name_target or team_present_mistral}, "
-                         f"Тип присутствует: {handicap_type_present_mistral}. "
-                         f"Tesseract не запускается. Продолжаем прокрутку.", is_debug_message=True)
+            telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Условие Mistral не пройдено (Значение: {handicap_value_present_mistral}, Тип: {handicap_type_present_mistral}, Команда: {not team_name_target or team_present_mistral}). Tesseract не запускается. Продолжаем прокрутку.", is_debug_message=True)
 
         pyautogui.scroll(-4)
         time.sleep(1)
