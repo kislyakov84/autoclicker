@@ -14,13 +14,14 @@ import logging
 
 import base64
 from mistralai import Mistral
-#from mistralai.models.chat import TextChunk # ВОССТАНОВЛЕНО: УБРАН КОММЕНТАРИЙ
+#from mistralai.models.chat import TextChunk # ВОССТАНОВЛЕНО: УБРАН КОММЕНТАРИЙ (В соответствии с обсуждением)
+# Mistral v1.5.2 and above automatically handle ContentChunk/str. No explicit import needed.
 
 from typing import Optional, Tuple, List, Any, Dict
 
 import pytesseract
 
-
+# --- НАЧАЛО ИСПРАВЛЕНИЯ: Перемещаем telegram_log сюда ---
 def telegram_log(message, is_debug_message: bool = False):
     debug_logging_actual = globals().get("DEBUG_LOGGING_ENABLED", True)
     if is_debug_message and not debug_logging_actual:
@@ -39,27 +40,30 @@ def telegram_log(message, is_debug_message: bool = False):
     subscribers_to_iterate = set(current_subscribers)
     for chat_id_local in subscribers_to_iterate:
         send_message(chat_id_local, message_to_send)
+# --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 # --- НАСТРОЙКИ OCR И ОТЛАДКИ ---
-OCR_PROVIDER = "mistral"
+OCR_PROVIDER = "mistral" # Или "tesseract" для принудительного использования Tesseract
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 
-DEBUG_LOGGING_ENABLED = True
+DEBUG_LOGGING_ENABLED = True # Оставляем True для отладки
 # ------------------------
 
-logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
-
-# ---------------------- Настройки Telegram-бота ----------------------
+# Глобальные переменные для Telegram-бота и настроек
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     print("[ERROR] TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 SUBSCRIBERS_FILE = "subscribers.txt"
-subscribers = set()
+subscribers = set() # Инициализируем пустой набор подписчиков
 
-DEBUG_SCREENSHOT = True
+DEBUG_SCREENSHOT = True # Отправлять ли отладочные скриншоты в Telegram
 
+# Инициализация логгирования
+logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
+
+# Инициализация Mistral AI клиента
 mistral_client = None
 if OCR_PROVIDER == "mistral":
     if MISTRAL_API_KEY:
@@ -82,14 +86,40 @@ if OCR_PROVIDER == "mistral" and not mistral_client:
     print(f"[CRITICAL_ERROR] OCR_PROVIDER is 'mistral', but Mistral OCR client is not initialized. OCR will not work.")
     telegram_log("[CRITICAL_ERROR] OCR (Mistral) недоступен: клиент не инициализирован.", is_debug_message=False)
 
+
+# ОБНОВЛЕННЫЕ ЛУЧШИЕ ПАРАМЕТРЫ ДЛЯ TESSERACT (после тюнинга)
 BEST_TESSERACT_PARAMS = {
-    'scale_factor': 3,
-    'contrast_enhance': 1.8,
-    'sharpness_enhance': 2.0,
+    'scale_factor': 4,
+    'contrast_enhance': 2.5,
+    'sharpness_enhance': 2.5,
     'adaptive_method': cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
     'adaptive_block_size': 19,
     'adaptive_C': 5,
-    'median_blur_kernel': 3
+    'median_blur_kernel': 3,
+    'clahe_clip_limit': 2.0,
+    'clahe_tile_grid_size': (8, 8),
+    'denoise_h': 5.0,
+    'denoise_template_window_size': 7,
+    'denoise_search_window_size': 21
+}
+
+# ОБНОВЛЕННЫЙ OCR_CHAR_MAP для более строгих паттернов
+OCR_CHAR_MAP = {
+    '0': '[0O]',     # Allow 'O' for zero
+    '1': '[1li]',    # Allow 'l' or 'i' for one
+    '2': '[2Zz]',    # Allow 'Z' or 'z' for two
+    '3': '[3]',
+    '4': '[4]',
+    '5': '[5S]',     # Allow 'S' for five
+    '6': '[6G]',     # Allow 'G' for six
+    '7': '[7]',
+    '8': '[8]',
+    '9': '[9]',
+    '-': '[-—]',    # Hyphen or em-dash (removed 'a' as it was too broad based on previous log analysis)
+    '.': '[\.,]',    # Dot or comma
+    '(': '[\(]',    # Escaped parenthesis
+    ')': '[\)]',    # Escaped parenthesis
+    '+': '[\+]',    # Escaped plus
 }
 
 
@@ -100,9 +130,16 @@ def preprocess_for_tesseract(pil_image: Image.Image,
                              adaptive_method: int = cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                              adaptive_block_size: int = 21,
                              adaptive_C: int = 5,
-                             median_blur_kernel: int = 1) -> Image.Image:
+                             median_blur_kernel: int = 1,
+                             clahe_clip_limit: float = 2.0,
+                             clahe_tile_grid_size: Tuple[int, int] = (8, 8),
+                             denoise_h: float = 0.0,
+                             denoise_template_window_size: int = 7,
+                             denoise_search_window_size: int = 21
+                            ) -> Image.Image:
     """
     Предобработка изображения для Tesseract OCR с настраиваемыми параметрами.
+    Включены CLAHE и FastNlMeansDenoising.
     """
 
     new_width = int(pil_image.width * scale_factor)
@@ -115,9 +152,28 @@ def preprocess_for_tesseract(pil_image: Image.Image,
     pil_image = enhancer.enhance(sharpness_enhance)
 
     open_cv_image = np.array(pil_image.convert('RGB'))
-    open_cv_image = open_cv_image[:, :, ::-1].copy()
+    open_cv_image = open_cv_image[:, :, ::-1].copy() # Convert RGB to BGR
 
     gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+
+    # Адаптивная нормализация контраста (CLAHE)
+    try:
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_tile_grid_size)
+        gray = clahe.apply(gray)
+        telegram_log(f"[DEBUG_PREPROCESS] Выполнена адаптивная нормализация контраста (CLAHE, clipLimit={clahe_clip_limit}, tileGridSize={clahe_tile_grid_size}).", is_debug_message=True)
+    except Exception as e:
+        telegram_log(f"[ERROR_PREPROCESS] Ошибка при применении CLAHE: {e}", is_debug_message=True)
+
+    # Денойзинг (FastNlMeansDenoising)
+    if denoise_h > 0:
+        try:
+            # fastNlMeansDenoising требует 8-битного одноканального изображения
+            gray = cv2.fastNlMeansDenoising(gray, None, h=denoise_h,
+                                             templateWindowSize=denoise_template_window_size,
+                                             searchWindowSize=denoise_search_window_size)
+            telegram_log(f"[DEBUG_PREPROCESS] Выполнен денойзинг (FastNlMeansDenoising, h={denoise_h}, templateWS={denoise_template_window_size}, searchWS={denoise_search_window_size}).", is_debug_message=True)
+        except Exception as e:
+            telegram_log(f"[ERROR_PREPROCESS] Ошибка при применении FastNlMeansDenoising: {e}", is_debug_message=True)
 
     thresh = cv2.adaptiveThreshold(
         gray, 255, adaptive_method,
@@ -129,6 +185,20 @@ def preprocess_for_tesseract(pil_image: Image.Image,
         thresh = cv2.medianBlur(thresh, median_blur_kernel)
 
     return Image.fromarray(thresh)
+
+def create_flexible_pattern(input_string: str) -> str:
+    """
+    Creates a regex pattern from a string, allowing for *minimal* common OCR errors
+    and optional spaces.
+    """
+    pattern_chars = []
+    for char in input_string:
+        if char in OCR_CHAR_MAP:
+            pattern_chars.append(OCR_CHAR_MAP[char])
+        else:
+            pattern_chars.append(re.escape(char.lower())) # For other chars, just escape and lower for a general match
+    return '(?:\s*' + ''.join(pattern_chars) + '\s*)' # Allow optional spaces around the full pattern
+
 
 def extract_text_mistral_ocr(pil_image: Image.Image) -> Tuple[str, List[List[Any]]]:
     """
@@ -169,28 +239,21 @@ def extract_text_mistral_ocr(pil_image: Image.Image) -> Tuple[str, List[List[Any
             full_text = ""
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 content_result = response.choices[0].message.content
-                # >>> ИСПРАВЛЕНИЕ: Правильная обработка списка ContentChunk для объединения всех текстовых фрагментов
-                if isinstance(content_result, list) and content_result:
+                # Mistralai==1.5.2 and above directly returns str or list of str/ContentChunk,
+                # we handle both for robustness.
+                if isinstance(content_result, list):
                     all_text_chunks = []
                     for chunk in content_result:
-                        # Ensure TextChunk is imported for this check
-                        try:
-                            # Safely import TextChunk only when needed, to avoid breaking if it's not present
-                            # or if mistralai version is older.
-                            from mistralai.models.chat import TextChunk
-                            if isinstance(chunk, TextChunk): # Проверяем, является ли блок текстовым
-                                all_text_chunks.append(chunk.text.strip())
-                            elif isinstance(chunk, str): # Fallback for older versions or different content types
-                                all_text_chunks.append(chunk.strip())
-                        except ImportError: # If TextChunk not imported, treat as string
-                            if isinstance(chunk, str):
-                                all_text_chunks.append(chunk.strip())
-                    full_text = "\n".join(all_text_chunks) # Объединяем все текстовые фрагменты
+                        if hasattr(chunk, 'text'): # For ContentChunk objects
+                            all_text_chunks.append(chunk.text.strip())
+                        elif isinstance(chunk, str): # For raw string chunks
+                            all_text_chunks.append(chunk.strip())
+                    full_text = "\n".join(all_text_chunks)
                 elif isinstance(content_result, str):
                     full_text = content_result.strip()
 
             if full_text:
-                telegram_log(f"[DEBUG_MISTRAL_API] Mistral OCR успешно (Попытка 1). Длина текста: {len(full_text)}", is_debug_message=True)
+                telegram_log(f"[DEBUG_MISTRAL_API] Mistral OCR успешно (Попытка {attempt + 1}). Длина текста: {len(full_text)}", is_debug_message=True)
                 return full_text, []
             else:
                 telegram_log(f"[ERROR_MISTRAL_API] Mistral OCR не вернул контент (Попытка {attempt + 1}).", is_debug_message=True)
@@ -243,9 +306,7 @@ def extract_text_tesseract(pil_image: Image.Image, **kwargs) -> Tuple[str, List[
 
         processed_img = preprocess_for_tesseract(pil_image, **local_kwargs)
 
-
-        # custom_config = r'--oem 1 --psm 3 -c tessedit_char_whitelist=0123456789().,-+АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъьэюяABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-        custom_config = r'--oem 1 --psm 3' # ИЗМЕНЕНИЕ: Убран tessedit_char_whitelist для более гибкого распознавания
+        custom_config = r'--oem 1 --psm 3'
 
         full_text = pytesseract.image_to_string(
             processed_img,
@@ -278,10 +339,10 @@ def extract_text_tesseract(pil_image: Image.Image, **kwargs) -> Tuple[str, List[
             w_original = int(w_scaled / scale_factor)
             h_original = int(h_scaled / scale_factor)
 
-            vertices = [(x_original, y_original), (x_original + w_original, y_original), (x_original + w_original, y_original + h_original), (x_original, y_original + h_original)] # Исправлена последняя вершина
+            vertices = [(x_original, y_original), (x_original + w_original, y_original), (x_original + w_original, y_original + h_original), (x_original, y_original + h_original)]
             results.append([vertices, text, conf])
 
-        telegram_log(f"[DEBUG_TESSERACT_COORDS] Tesseract: Обратное масштабирование координат выполнено с scale_factor={scale_factor}. Пример первой координаты: (x_scaled={data['left'][0]}, y_scaled={data['top'][0]}) -> (x_original={results[0][0][0][0]}, y_original={results[0][0][0][1]})", is_debug_message=True)
+        telegram_log(f"[DEBUG_TESSERACT_COORDS] Tesseract: Обратное масштабирование координат выполнено с scale_factor={scale_factor}. Пример первой координаты: (x_scaled={data['left'][0] if data['left'] else 'N/A'}, y_scaled={data['top'][0] if data['top'] else 'N/A'}) -> (x_original={results[0][0][0][0] if results else 'N/A'}, y_original={results[0][0][0][1] if results else 'N/A'})", is_debug_message=True)
 
         return full_text, results
     except Exception as e:
@@ -298,137 +359,19 @@ def get_ocr_results(pil_image: Image.Image) -> Tuple[str, List[List[Any]]]:
         return extract_text_mistral_ocr(pil_image)
     elif OCR_PROVIDER == "tesseract":
         print("[INFO_OCR] Using Tesseract OCR.")
-        # Передаем найденные параметры в extract_text_tesseract
         return extract_text_tesseract(pil_image, **BEST_TESSERACT_PARAMS)
-    # Если OCR_PROVIDER установлен в mistral, но клиент не инициализирован, откатываемся к tesseract
     elif OCR_PROVIDER == "mistral" and not mistral_client:
         print("[WARNING_OCR] OCR_PROVIDER set to mistral but client not available, falling back to Tesseract.")
         telegram_log("[WARNING_OCR] OCR_PROVIDER set to mistral but client not available, falling back to Tesseract.", is_debug_message=True)
         return extract_text_tesseract(pil_image, **BEST_TESSERACT_PARAMS)
     else:
-        # Если ни один из провайдеров не выбран или не настроен корректно
         print("[ERROR_OCR] No OCR provider is available or initialized correctly.")
         telegram_log("[ERROR_OCR] No OCR provider is available or initialized correctly.", is_debug_message=False)
         return "", []
 
-def score_ocr_result(full_text_ocr: str, ocr_blocks: List[List[Any]],
-                     target_handicap_display: str, target_coef_value: str) -> float:
-    """
-    Оценивает качество OCR распознавания для заданного целевого текста.
-    Возвращает числовой балл, чем больше, тем лучше.
-    """
-    score = 0.0
-    full_text_lower = full_text_ocr.lower().replace(" ", "").replace(",", ".")
-
-    target_handicap_lower = target_handicap_display.lower().replace(" ", "")
-    if target_handicap_lower in full_text_lower:
-        score += 1.0
-
-    target_coef_lower = target_coef_value.lower().replace(",", ".")
-    if target_coef_lower != "нет_коэф" and target_coef_lower in full_text_lower:
-        score += 1.0
-
-    for block_vertices, block_text, block_conf in ocr_blocks:
-        block_text_lower = block_text.lower().replace(" ", "").replace(",", ".")
-        if target_handicap_lower in block_text_lower:
-            if target_coef_lower != "нет_коэф" and target_coef_lower in block_text_lower:
-                score += 2.0
-                score += block_conf / 100.0
-                break
-
-    found_handicap_block_conf = 0.0
-    for block_vertices, block_text, block_conf in ocr_blocks:
-        block_text_cleaned = block_text.replace(" ", "").replace(",", ".")
-        if target_handicap_lower in block_text_cleaned:
-            found_handicap_block_conf = max(found_handicap_block_conf, block_conf)
-    score += found_handicap_block_conf / 200.0
-
-    return score
-
-
-def tune_tesseract_preprocessing(
-    target_pil_image: Image.Image,
-    target_ocr_text_samples: List[str],
-    max_combinations: int = 5000
-) -> Optional[Dict[str, Any]]:
-    """
-    Автоматически подбирает лучшие параметры предобработки для Tesseract OCR
-    на основе распознавания целевых текстов.
-
-    Возвращает словарь с лучшими параметрами или None, если ничего не найдено.
-    """
-
-    param_ranges = {
-        'scale_factor': [3, 4],
-        'contrast_enhance': [1.8, 2.5],
-        'sharpness_enhance': [2.0, 2.5],
-        'adaptive_method': [cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.ADAPTIVE_THRESH_MEAN_C],
-        'adaptive_block_size': [5, 7, 9, 11, 13, 15, 17, 19, 21],
-        'adaptive_C': [-10, -5, -3, 0, 3, 5, 7, 9, 10],
-        'median_blur_kernel': [1, 3]
-    }
-
-    best_score = -1.0
-    best_params = None
-
-    import itertools
-    all_combinations = list(itertools.product(*param_ranges.values()))
-
-    telegram_log(f"[TUNER] Начинаю перебор {len(all_combinations)} комбинаций параметров. Это может занять время!", is_debug_message=False)
-
-    for i, params_tuple in enumerate(all_combinations):
-        if i >= max_combinations:
-            telegram_log(f"[TUNER] Достигнуто максимальное количество комбинаций ({max_combinations}). Завершаю перебор.", is_debug_message=False)
-            break
-
-        current_params = {
-            'scale_factor': params_tuple[0],
-            'contrast_enhance': params_tuple[1],
-            'sharpness_enhance': params_tuple[2],
-            'adaptive_method': params_tuple[3],
-            'adaptive_block_size': params_tuple[4],
-            'adaptive_C': params_tuple[5],
-            'median_blur_kernel': params_tuple[6]
-        }
-
-        if current_params['adaptive_block_size'] % 2 == 0 or current_params['adaptive_block_size'] <= 1:
-            current_params['adaptive_block_size'] = current_params['adaptive_block_size'] + 1 if current_params['adaptive_block_size'] > 1 else 3
-
-        try:
-            processed_img = preprocess_for_tesseract(target_pil_image.copy(), **current_params)
-            full_text, ocr_blocks = extract_text_tesseract(processed_img, **current_params)
-
-            current_total_score_for_params = 0.0
-            for target_sample_text in target_ocr_text_samples:
-                handicap_match = re.search(r'(\(([-+]?\d+(?:\.\d+)?)\))', target_sample_text)
-                if not handicap_match:
-                    continue
-
-                target_handicap_display_sample = handicap_match.group(1).strip()
-                target_coef_value_sample = "НЕТ_КОЭФ"
-                coef_search = re.search(r'([0-9]+(?:[.,][0-9]+)?)$', target_sample_text)
-                if coef_search:
-                    target_coef_value_sample = coef_search.group(1).replace(",", ".")
-
-                current_total_score_for_params += score_ocr_result(full_text, ocr_blocks,
-                                                                   target_handicap_display_sample, target_coef_value_sample)
-
-            if current_total_score_for_params > best_score:
-                best_score = current_total_score_for_params
-                best_params = current_params
-                telegram_log(f"[TUNER_BEST] Новые лучшие параметры! Total Score: {best_score:.2f}, Params: {best_params}", is_debug_message=True)
-
-        except Exception as e:
-            telegram_log(f"[TUNER_ERROR] Ошибка при тестировании параметров {current_params}: {e}", is_debug_message=True)
-            continue
-
-    if best_params:
-        telegram_log(f"[TUNER_FINAL] Автоматическая настройка завершена. Лучший общий балл: {best_score:.2f}", is_debug_message=False)
-        telegram_log(f"[TUNER_FINAL] Найдены лучшие параметры предобработки: {best_params}", is_debug_message=False)
-    else:
-        telegram_log(f"[TUNER_FINAL] Автоматическая настройка не нашла подходящих параметров.", is_debug_message=False)
-
-    return best_params
+# NOTE: tune_tesseract_preprocessing is a utility for offline tuning and is not used in runtime.
+# It is kept here as a reference but could be moved to a separate utility script.
+# def tune_tesseract_preprocessing(...)
 
 def load_subscribers():
     subscribers_file_path = globals().get("SUBSCRIBERS_FILE", "subscribers.txt")
@@ -554,7 +497,6 @@ def poll_updates():
         time.sleep(1)
 
 def open_browser_and_navigate():
-
     pyautogui.click(413, 363)
     telegram_log("[STEP 0] Клик по координатам (413, 363) для ввода proxy")
     pyautogui.write("otwyn7rnye-mobile-country-RU-state-524894-city-524901-hold-session-session-68234428f20a1", interval=0.05)
@@ -703,13 +645,15 @@ def is_fuzzy_match(target_name: str, ocr_text: str) -> bool:
     if len(target_words) > 0:
         matched_words_count = 0
         for t_word in target_words:
-            if t_word in ocr_words:
+            if t_word in ocr_words: # Basic word presence
                 matched_words_count += 1
 
+        # Consider a match if at least half of the target words are present,
+        # or if it's a single word and it's a substring of an OCR word (or vice-versa).
         if matched_words_count >= len(target_words) / 2:
             return True
 
-        if len(target_words) == 1 and len(target_words[0]) > 3:
+        if len(target_words) == 1 and len(target_words[0]) > 3: # For single, longer words
             for o_word in ocr_words:
                 if target_words[0] in o_word or o_word in target_words[0]:
                     return True
@@ -719,9 +663,9 @@ def is_fuzzy_match(target_name: str, ocr_text: str) -> bool:
 def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]], team_name_target: Optional[str], region_offset_x: int = 0, region_offset_y: int = 0) -> bool:
     """
     Находит и кликает по исходу форы в данном наборе OCR-блоков.
-    Tesseract здесь фокусируется только на поиске конкретного значения форы и коэффициента.
-    Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота.
-    # Удалено из docstring: Добавлена логика привязки к имени команды.
+    Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота,
+    они относительны к переданному региону.
+    region_offset_x/y - абсолютные координаты верхнего левого угла региона, из которого взяты ocr_blocks.
     """
 
     handicap_match = re.search(r'(\(([-+]?\d+(?:\.\d+)?)\))', target_outcome)
@@ -730,127 +674,145 @@ def _click_handicap_from_blocks(target_outcome: str, ocr_blocks: List[List[Any]]
         return False
 
     handicap_display_str = handicap_match.group(1).strip() # e.g., "(-1.0)"
-    handicap_value_float = float(handicap_match.group(2)) # e.g., -1.0
     handicap_value_float_str = handicap_match.group(2).strip() # e.g., "-1.0"
-    handicap_value_abs_str = str(abs(handicap_value_float)) # e.g., "1.0"
 
-    telegram_log(f"[HANDICAP_CLICK_HELPER] Tesseract ищет: Value='{handicap_value_float}' (Display='{handicap_display_str}')", is_debug_message=True)
+    telegram_log(f"[HANDICAP_CLICK_HELPER] Tesseract ищет: Display='{handicap_display_str}' (Value='{handicap_value_float_str}')", is_debug_message=True)
 
     Y_LINE_TOLERANCE_COEF = 15
     X_COEF_SEARCH_RANGE = 300
+    TEAM_COLUMN_SEARCH_Y_DIFF = 150 # Minimum Y difference to look for a column header above (Increased)
+    TEAM_COLUMN_X_TOLERANCE = 70 # X-tolerance for a handicap block to fall under a team column header (Increased)
 
-    # Define a character mapping for common OCR errors (simplified)
-    # This map allows for typical misinterpretations by Tesseract
-    OCR_CHAR_MAP = {
-        '0': '[0o]', '1': '[1l]', '2': '[2z]', '3': '[3]', '4': '[4]',
-        '5': '[5s]', '6': '[6]', '7': '[7]', '8': '[8]', '9': '[9]',
-        '-': '[—\-a]', # Hyphen, em-dash, or 'a' (common for minus sign)
-        '.': '[\.,]', # Dot or comma
-        '(': '[\(]',
-        ')': '[\)]',
-        '+': '[\+]',
-    }
 
-    def create_flexible_pattern(input_string):
-        """Creates a regex pattern from a string, allowing for common OCR errors and optional spaces."""
-        pattern_chars = []
-        for char in input_string.lower().replace(' ', ''): # Normalize input string (remove spaces, convert to lower)
-            pattern_chars.append(OCR_CHAR_MAP.get(char, re.escape(char))) # Use map or escape if not in map
-        return '(?:\s*' + ''.join(pattern_chars) + '\s*)' # Allow optional spaces around the full pattern
-
-    # Convert the target display string and numeric value into flexible regex patterns for Tesseract's output.
-    flexible_display_pattern = create_flexible_pattern(handicap_display_str) # e.g., "(-1.5)" -> "[\(\s]*[—\-a]?1[\.,]5[\)\s]*"
-    flexible_numeric_value_pattern = create_flexible_pattern(handicap_value_float_str) # e.g., "-1.5" -> "[—\-a]?1[\.,]5"
-    flexible_abs_numeric_pattern = create_flexible_pattern(handicap_value_abs_str) # e.g., "1.5" -> "1[\.,]5"
+    # Create flexible patterns for precise matching of the handicap string/value
+    # Use re.escape for the value part and allow optional spaces around it
+    # Modified to allow broader search within blocks, not just full match
+    flexible_display_pattern = create_flexible_pattern(handicap_display_str)
+    flexible_numeric_value_only_pattern = create_flexible_pattern(handicap_value_float_str)
 
 
     potential_handicap_blocks = []
     for idx, block in enumerate(ocr_blocks):
         block_text = block[1] # Original text from Tesseract
-        # Aggressively clean Tesseract's block text for matching
-        # Remove all whitespace, and replace commas with dots, and em-dashes with hyphens
         block_text_cleaned_for_match = block_text.lower().replace(' ', '').replace(',', '.').replace('—', '-')
 
-        is_handicap_value_matched = False
-
-        # Try matching the full display string (e.g., "(-1.5)") with flexibility
+        # Check if the handicap display string (e.g., "(-1.0)") is present in the block
+        # Using re.search instead of re.fullmatch for more flexibility within blocks
         if re.search(flexible_display_pattern, block_text_cleaned_for_match):
-            is_handicap_value_matched = True
-            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible display pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_display_str}'", is_debug_message=True)
-        # Try matching just the numeric value (e.g., "-1.5") with flexibility
-        elif re.search(flexible_numeric_value_pattern, block_text_cleaned_for_match):
-            is_handicap_value_matched = True
-            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible numeric value pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_value_float_str}'", is_debug_message=True)
-        # Try matching just the absolute numeric value (e.g., "1.5"), might miss sign or parentheses, with flexibility
-        elif re.search(flexible_abs_numeric_pattern, block_text_cleaned_for_match):
-            is_handicap_value_matched = True
-            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract matched flexible absolute numeric pattern: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') against '{handicap_value_abs_str}'", is_debug_message=True)
-        else:
-            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract did NOT match: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') with any handicap patterns for '{handicap_display_str}'", is_debug_message=True)
+            potential_handicap_blocks.append({"block": block, "idx": idx, "priority": 1, "match_type": "display_contained"})
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract found DISPLAY pattern (P1): '{block_text}' (cleaned:'{block_text_cleaned_for_match}') contains '{handicap_display_str}'", is_debug_message=True)
+            continue
 
+        # Check if just the numeric value (e.g., "-1.0") is present in the block
+        if re.search(flexible_numeric_value_only_pattern, block_text_cleaned_for_match):
+            potential_handicap_blocks.append({"block": block, "idx": idx, "priority": 2, "match_type": "value_contained"})
+            telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract found NUMERIC VALUE pattern (P2): '{block_text}' (cleaned:'{block_text_cleaned_for_match}') contains '{handicap_value_float_str}'", is_debug_message=True)
+            continue
 
-        if is_handicap_value_matched:
-            potential_handicap_blocks.append(block)
-            telegram_log(f"[HANDICAP_CLICK_HELPER] Найден ПОТЕНЦИАЛЬНЫЙ целевой блок форы: '{block_text}'.", is_debug_message=True)
-
+        # --- ИЗМЕНЕНИЕ: Убираем избыточное логирование для "NOT match" ---
+        # telegram_log(f"[DEBUG_CLICK_HELPER] Tesseract did NOT match: '{block_text}' (cleaned:'{block_text_cleaned_for_match}') with any handicap full-match patterns for '{handicap_display_str}'", is_debug_message=True)
 
     if not potential_handicap_blocks:
         telegram_log(f"[HANDICAP_CLICK_HELPER] Потенциальные блоки форы для '{handicap_display_str}' не найдены Tesseract'ом.", is_debug_message=True)
         return False
 
-    # Теперь из потенциальных блоков форы находим соответствующий коэффициент и кликаем
-    for block in potential_handicap_blocks:
-        x_block, y_block = block[0][0][0], block[0][0][1]
-        block_width = block[0][1][0] - block[0][0][0]
-        block_height = block[0][2][1] - block[0][0][1]
+    # Sort by priority (P1 preferred over P2), then by Y-coordinate, then by X-coordinate
+    potential_handicap_blocks.sort(key=lambda item: (item["priority"], item["block"][0][0][1], item["block"][0][0][0]))
 
-        telegram_log(f"[HANDICAP_CLICK_HELPER] Обработка потенциального блока форы: '{block[1]}'. Ищем коэффициент.", is_debug_message=True)
+    # Now, from potential handicap blocks, find the corresponding coefficient and click
+    for item in potential_handicap_blocks:
+        block_handicap_display = item["block"]
+        idx_handicap_block = item["idx"] # Fix: Was using `item["idx"]` here previously for the loop instead of `handicap_item["idx"]`
+        x_block_handicap_display, y_block_handicap_display = block_handicap_display[0][0][0], block_handicap_display[0][0][1]
+        block_width = block_handicap_display[0][1][0] - block_handicap_display[0][0][0]
+        block_height = block_handicap_display[0][2][1] - block_handicap_display[0][0][1]
 
-        # 1. Попытка найти коэффициент ВСТРОЕННЫЙ (если текст блока форы его содержит)
-        text_in_block_normalized = block[1].replace(' ', '').replace(',', '.')
-        handicap_text_in_target_outcome_normalized = handicap_display_str.replace(' ', '')
+        telegram_log(f"[HANDICAP_CLICK_HELPER] Обработка потенциального блока форы: '{block_handicap_display[1]}'. Ищем коэффициент и команду. Match Type: {item['match_type']}.", is_debug_message=True)
+
+        # --- ИЗМЕНЕНИЕ: Новая логика поиска команды-заголовка столбца ---
+        if team_name_target:
+            team_found_for_this_handicap = False
+            
+            # Identify the horizontal range of the handicap block for column alignment
+            handicap_x_center = x_block_handicap_display + block_width / 2
+            
+            # Search upwards for team column headers in the entire OCR block list (not just before current block)
+            # We search from the beginning to find headers which are usually at the top
+            for i_team_check, check_block_team in enumerate(ocr_blocks):
+                y_check_block_team = check_block_team[0][0][1]
+                x_check_block_team_min = check_block_team[0][0][0]
+                x_check_block_team_max = check_block_team[0][1][0]
+                team_block_text = check_block_team[1]
+
+                # Check if block is significantly above and within column X-range
+                if y_check_block_team < y_block_handicap_display - TEAM_COLUMN_SEARCH_Y_DIFF:
+                    if x_check_block_team_min - TEAM_COLUMN_X_TOLERANCE <= handicap_x_center <= x_check_block_team_max + TEAM_COLUMN_X_TOLERANCE:
+                        # Check if this block fuzzy matches the target team name
+                        if is_fuzzy_match(team_name_target, team_block_text):
+                            # Exclude blocks that are pure numbers, e.g., '1' or '2' or '3.20'
+                            if not re.fullmatch(r'^\d+(\.\d+)?$', team_block_text.strip().replace(',', '.')):
+                                team_found_for_this_handicap = True
+                                telegram_log(f"[HANDICAP_CLICK_HELPER] Команда '{team_name_target}' найдена ('{team_block_text}') как заголовок столбца для форы '{block_handicap_display[1]}'.", is_debug_message=True)
+                                break # Found the column header, no need to search further up
+                            else:
+                                telegram_log(f"[HANDICAP_CLICK_HELPER] Блок '{team_block_text}' является числом, а не именем команды. Пропускаем.", is_debug_message=True)
+                        else:
+                            telegram_log(f"[HANDICAP_CLICK_HELPER] Блок '{team_block_text}' находится в колонке, но не соответствует команде '{team_name_target}'.", is_debug_message=True)
+                # If we've passed the Y-range where headers might be, stop searching.
+                elif y_check_block_team > y_block_handicap_display: # We're below the handicap block, no headers here.
+                    break
+
+
+            if not team_found_for_this_handicap:
+                telegram_log(f"[HANDICAP_CLICK_HELPER] Команда '{team_name_target}' НЕ найдена как заголовок столбца для форы '{block_handicap_display[1]}'. Пропускаем эту форы.", is_debug_message=True)
+                continue # Try next potential handicap block
+
+        # 2. Extract Coefficient from the block (if it contains both handicap and coef)
+        block_text_for_coef_extraction = block_handicap_display[1].replace(' ', '').replace(',', '.')
         
-        coef_match_inline = re.search(r'\b(\d+(?:\.\d+)?)$', text_in_block_normalized)
+        # Try to find the handicap display string followed by a coefficient in the same block
+        # e.g., "(-1.0)1.615"
+        handicap_and_coef_pattern = create_flexible_pattern(handicap_display_str).strip('?') + r'(\d+(?:\.\d+)?)$' # Remove trailing '?' from flexible pattern for stricter search
+        coef_match_inline = re.search(handicap_and_coef_pattern, block_text_for_coef_extraction)
+
         if coef_match_inline:
-            handicap_idx_in_block = text_in_block_normalized.find(handicap_text_in_target_outcome_normalized)
-            coef_idx_in_block = text_in_block_normalized.find(coef_match_inline.group(1))
+            coef_text = coef_match_inline.group(1) # Use group(1) for the captured coefficient
+            # Use the center of the found handicap block for clicking
+            block_center_x = x_block_handicap_display + block_width / 2
+            block_center_y = y_block_handicap_display + block_height / 2
 
-            if handicap_idx_in_block != -1 and coef_idx_in_block != -1 and coef_idx_in_block > handicap_idx_in_block:
-                coef_text = coef_match_inline.group(1)
-                block_center_x = x_block + block_width / 2
-                block_center_y = y_block + block_height / 2
-                
-                pyautogui.click(int(block_center_x) + region_offset_x, int(block_center_y) + region_offset_y)
-                telegram_log(f"[HANDICAP_CLICK_HELPER][INLINE_COEF] Кликнута фора '{block[1]}' со встроенным коэф. '{coef_text}' по ({int(block_center_x) + region_offset_x}, {int(block_center_y) + region_offset_y}).", is_debug_message=True)
-                time.sleep(0.5) # Добавлена задержка
-                return True
+            pyautogui.click(int(block_center_x) + region_offset_x, int(block_center_y) + region_offset_y)
+            telegram_log(f"[КЛИК][HANDICAP_CLICK_HELPER][INLINE_COEF] Кликнута фора '{block_handicap_display[1]}' со встроенным коэф. '{coef_text}' по ({int(block_center_x) + region_offset_x}, {int(block_center_y) + region_offset_y}).", is_debug_message=True)
+            time.sleep(0.5)
+            return True
 
-        # 2. Попытка найти коэффициент в соседних блоках
-        for j in range(ocr_blocks.index(block) + 1, len(ocr_blocks)):
+        # If not inline, look for the coefficient in adjacent blocks
+        telegram_log(f"[HANDICAP_CLICK_HELPER][DEBUG] Ищем соседний коэффициент для блока: '{block_handicap_display[1]}'.", is_debug_message=True)
+        found_coef_adjacent = False
+        for j in range(idx_handicap_block + 1, len(ocr_blocks)):
             next_block = ocr_blocks[j]
             x_next_block, y_next_block = next_block[0][0][0], next_block[0][0][1]
 
-            if abs(y_next_block - y_block) < Y_LINE_TOLERANCE_COEF and \
-               x_next_block > x_block and \
-               (x_next_block - (x_block + block_width)) < X_COEF_SEARCH_RANGE:
-                
+            if abs(y_next_block - y_block_handicap_display) < Y_LINE_TOLERANCE_COEF and \
+               x_next_block > x_block_handicap_display and \
+               (x_next_block - (x_block_handicap_display + block_width)) < X_COEF_SEARCH_RANGE:
+
                 if re.match(r'^\d+(?:\.\d+)?$', next_block[1].replace(',', '.')):
                     coef_block_width = next_block[0][1][0] - next_block[0][0][0]
                     coef_block_height = next_block[0][2][1] - next_block[0][0][1]
 
                     coef_block_center_x = x_next_block + coef_block_width / 2
                     coef_block_center_y = y_next_block + coef_block_height / 2
-                    
+
                     pyautogui.click(int(coef_block_center_x) + region_offset_x, int(coef_block_center_y) + region_offset_y)
-                    telegram_log(f"[HANDICAP_CLICK_HELPER][ADJ_COEF] Кликнута фора '{block[1]}' с соседним коэф. '{next_block[1]}' по ({int(coef_block_center_x) + region_offset_x}, {int(coef_block_center_y) + region_offset_y}).", is_debug_message=True)
-                    time.sleep(0.5) # Добавлена задержка
+                    telegram_log(f"[КЛИК][HANDICAP_CLICK_HELPER][ADJ_COEF] Кликнута фора '{block_handicap_display[1]}' с соседним коэф. '{next_block[1]}' по ({int(coef_block_center_x) + region_offset_x}, {int(coef_block_center_y) + region_offset_y}).", is_debug_message=True)
+                    time.sleep(0.5)
                     return True
-                else:
-                    telegram_log(f"[HANDICAP_CLICK_HELPER][DEBUG] Блок '{next_block[1]}' горизонтально близко, но не является коэффициентом. (dx={x_next_block - (x_block + block_width)}).", is_debug_message=True)
-            elif y_next_block - y_block > Y_LINE_TOLERANCE_COEF * 2:
-                break
-            elif x_next_block - (x_block + block_width) > X_COEF_SEARCH_RANGE:
-                break
+                # else: # Removed this debug log for less verbosity
+            elif y_next_block - y_block_handicap_display > Y_LINE_TOLERANCE_COEF * 2:
+                break # Not on the same logical line anymore
+            elif x_next_block - (x_block_handicap_display + block_width) > X_COEF_SEARCH_RANGE:
+                break # Too far horizontally
 
     telegram_log(f"[HANDICAP_CLICK_HELPER] Не удалось найти и кликнуть по исходу для '{target_outcome}' даже после обработки потенциальных блоков. Действующий коэффициент не найден.", is_debug_message=True)
     return False
@@ -884,13 +846,18 @@ def optimized_search_for_outcome(expected_text, outcome_search_region, max_scrol
         current_screenshot_pil = pyautogui.screenshot(region=(x1, y1, region_width, region_height))
         time.sleep(1)
 
-        debug_outcome_path = f"debug_outcome_screenshot_{iteration+1}.png"
-        current_screenshot_pil.save(debug_outcome_path)
-        for chat_id in subscribers:
-            send_photo(chat_id, debug_outcome_path, caption=f"Скриншот поиска исхода, итерация {iteration+1}")
+        # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+        if DEBUG_SCREENSHOT:
+            debug_outcome_path = f"debug_outcome_screenshot_{iteration+1}.png"
+            current_screenshot_pil.save(debug_outcome_path)
+            for chat_id in subscribers:
+                send_photo(chat_id, debug_outcome_path, caption=f"Скриншот поиска исхода, итерация {iteration+1}")
 
         full_text, results = get_ocr_results(current_screenshot_pil)
-        ocr_debug = f"[OCR] Итерация {iteration+1}\nFull text:\n{full_text}\nBlocks:\n" + "\n".join([str(r) for r in results])
+        # --- ИЗМЕНЕНИЕ: Ограничиваем количество блоков для логирования ---
+        ocr_debug = f"[OCR] Итерация {iteration+1}\nFull text:\n{full_text}\nBlocks (first 10):\n" + "\n".join([str(r) for r in results[:10]])
+        if len(results) > 10:
+            ocr_debug += f"\n... (ещё {len(results)-10} блоков)"
         for chat_id in subscribers:
             send_message(chat_id, ocr_debug[:4000])
 
@@ -931,19 +898,21 @@ def optimized_search_for_outcome(expected_text, outcome_search_region, max_scrol
         time.sleep(1)
 
     telegram_log("[ERROR] Не удалось найти исход после прокрутки. Отправляю скриншот и сырые OCR-данные для диагностики.")
-    if last_screenshot_path:
+    # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+    if DEBUG_SCREENSHOT and last_screenshot_path:
         for chat_id in subscribers:
             send_photo(chat_id, last_screenshot_path, caption="Скриншот последней попытки поиска исхода")
     if last_full_text is not None and last_results is not None:
-        ocr_debug = f"[OCR] Последняя попытка\nFull text:\n{last_full_text}\nBlocks:\n" + "\n".join([str(r) for r in last_results])
+        ocr_debug = f"[OCR] Последняя попытка\nFull text:\n{last_full_text}\nBlocks (first 10):\n" + "\n".join([str(r) for r in last_results[:10]])
+        if len(last_results) > 10:
+            ocr_debug += f"\n... (ещё {len(last_results)-10} блоков)"
         for chat_id in subscribers:
             send_message(chat_id, ocr_debug[:4000])
     return None, None
 
 # ======================= Координаты и константы для ставок =======================
 
-BET_INPUT_CANDIDATES_SET1 = [(1202, 445), (1200, 491), (1200, 660)]
-BET_INPUT_CANDIDATES_SET2 = [(1201, 657)]
+# Удалены неиспользуемые BET_INPUT_CANDIDATES_SET1/2
 
 TARGET_COLOR = (218, 218, 218)
 COLOR_TOLERANCE = 4
@@ -1013,24 +982,7 @@ def check_yellow_in_region(region, r_tolerance=15, g_tolerance=15, b_tolerance=1
         telegram_log(f"[ERROR] Ошибка при проверке желтого цвета в регионе {region}: {e}")
         return False
 
-def check_yellow_pixel(x, y, r_tolerance=10, g_tolerance=10, b_tolerance=10):
-    """
-    Проверяет, является ли пиксель жёлтым с ожидаемыми значениями RGB ~ (96, 100, 75).
-    Допуски по умолчанию установлены в 10.
-    """
-    try:
-        screenshot = pyautogui.screenshot(region=(x, y, 1, 1))
-        pixel = screenshot.getpixel((0, 0))
-        r, g, b = pixel[:3]
-        is_yellow = (
-            abs(r - 96) <= r_tolerance and
-            abs(g - 100) <= g_tolerance and
-            abs(b - 75) <= b_tolerance
-        )
-        return is_yellow
-    except Exception as e:
-        telegram_log(f"[ERROR] Ошибка при проверке желтого пикселя в ({x},{y}): {e}")
-        return False
+# Удалена неиспользуемая функция check_yellow_pixel
 
 def check_coefficient_condition(found_coef, condition_str):
     """
@@ -1046,21 +998,21 @@ def check_coefficient_condition(found_coef, condition_str):
                 threshold = float(token[1:])
                 if not (found_coef >= threshold):
                     valid = False
-            except:
+            except ValueError: # Changed to ValueError for float conversion
                 valid = False
         elif token.startswith("<"):
             try:
                 threshold = float(token[1:])
                 if not (found_coef <= threshold):
                     valid = False
-            except:
+            except ValueError: # Changed to ValueError for float conversion
                 valid = False
         else:
             try:
                 exact_value = float(token)
                 if not (found_coef == exact_value):
                     valid = False
-            except:
+            except ValueError: # Changed to ValueError for float conversion
                 valid = False
     return valid
 
@@ -1074,10 +1026,12 @@ def extract_coefficient_from_region(region, max_retries=3, retry_delay=1):
 
     image_to_process = screenshot
 
-    debug_coef_path = "debug_coef_screenshot.png"
-    image_to_process.save(debug_coef_path)
-    for chat_id in subscribers:
-        send_photo(chat_id, debug_coef_path, caption=f"Скрин коэффициента (область {region})")
+    # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+    if DEBUG_SCREENSHOT:
+        debug_coef_path = "debug_coef_screenshot.png"
+        image_to_process.save(debug_coef_path)
+        for chat_id in subscribers:
+            send_photo(chat_id, debug_coef_path, caption=f"Финальный скрин коэффициента (область {region})")
 
     time.sleep(1)
 
@@ -1093,7 +1047,7 @@ def extract_coefficient_from_region(region, max_retries=3, retry_delay=1):
                 try:
                     coefficient = float(coef_str)
                     return coefficient
-                except Exception as e:
+                except ValueError: # Changed to ValueError for float conversion
                     telegram_log(f"[ERROR] Ошибка преобразования OCR результата '{coef_str}' в число: {e}", is_debug_message=True)
                     return None
             else:
@@ -1125,7 +1079,7 @@ def parse_coefficient_from_text(text):
         coef_str = matches[0].replace(",", ".")
         try:
             return float(coef_str)
-        except:
+        except ValueError: # Changed to ValueError for float conversion
             return None
     return None
 
@@ -1137,11 +1091,11 @@ def find_bet_input_coords(timeout=15, color_tolerance_ready=20, color_tolerance_
     Возвращает кортеж (координаты, тип_кандидата) или (None, None).
     Тип кандидата: "primary" или "secondary".
     """
-    # ОБНОВЛЕННЫЕ КООРДИНАТЫ И ЦВЕТА ИНДИКАТОРА ГОТОВНОСТИ (ПОСЛЕ АНАЛИЗА СКРИНШОТОВ)
-    # Если на скриншотах видно, что (1250, 249) все еще не зеленый, то нужно
-    # подобрать новую точку или цвет, либо увеличить таймаут.
-    READY_CHECK_COORDS = (1250, 249)
-    TARGET_READY_COLOR = (6, 136, 69) 
+    # --- ИЗМЕНЕНИЕ: Требуется актуализация по новому скриншоту купона! ---
+    # Эти координаты, вероятно, неверны, так как цвет не совпал.
+    # QA, пожалуйста, предоставьте скриншот полного экрана в момент появления купона.
+    READY_CHECK_COORDS = (1250, 249) # Цвет: (6, 136, 69)
+    TARGET_READY_COLOR = (6, 136, 69)
     CHECK_REGION_SIZE = 5
 
     BET_INPUT_PRIMARY = (1199, 319)
@@ -1152,18 +1106,18 @@ def find_bet_input_coords(timeout=15, color_tolerance_ready=20, color_tolerance_
     telegram_log(f"[DEBUG] Ожидание индикатора готовности поля ввода (цвет {TARGET_READY_COLOR} в {READY_CHECK_COORDS})...", is_debug_message=True)
 
     ready_indicator_found = False
-    debug_ss_counter = 0 # Добавляем счетчик для отладочных скриншотов
+    debug_ss_counter = 0
     while time.time() - start_time < timeout:
         region_ready = (READY_CHECK_COORDS[0], READY_CHECK_COORDS[1], CHECK_REGION_SIZE, CHECK_REGION_SIZE)
         try:
             screenshot_ready = pyautogui.screenshot(region=region_ready)
             stat_ready = ImageStat.Stat(screenshot_ready)
-            avg_color_ready = tuple(int(c) for c in stat_ready.mean) # Используем средний цвет для устойчивости
-            
+            avg_color_ready = tuple(int(c) for c in stat_ready.mean)
+
             telegram_log(f"[DEBUG] Проверка индикатора готовности: {READY_CHECK_COORDS}, текущий цвет {avg_color_ready}", is_debug_message=True)
 
-            # Отправка отладочного скриншота маленькой области для анализа
-            if DEBUG_SCREENSHOT: # Отправляем только если DEBUG_SCREENSHOT включен
+            # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+            if DEBUG_SCREENSHOT:
                 debug_ss_counter += 1
                 debug_path_ready = f"debug_ready_check_region_{debug_ss_counter}.png"
                 screenshot_ready.save(debug_path_ready)
@@ -1257,7 +1211,7 @@ def parse_halftime_handicap_outcome_new(outcome_str: str, match_name: Optional[s
             text_between = outcome_str[idx_half_end:idx_handicap_start].strip()
             text_between_cleaned = text_between
             if "победа с учетом форы" in text_between_cleaned.lower():
-                 text_between_cleaned = text_between_cleaned.lower().replace("победа с учетом фотом", "").strip()
+                 text_between_cleaned = text_between_cleaned.lower().replace("победа с учетом форы", "").strip() # Fixed typo
             if "фора" in text_between_cleaned.lower():
                 text_between_cleaned = text_between_cleaned.lower().replace("фора", "").strip()
 
@@ -1311,7 +1265,7 @@ def find_halftime_handicap_and_click_new(outcome_str: str, match_name: Optional[
     team_name_search = parsed_details["team_name"]
     handicap_display_search = parsed_details["handicap_display"]
 
-    Y_TOLERANCE_LINE = 20
+    Y_LINE_TOLERANCE_COEF = 20
 
     OUTCOME_SEARCH_REGION = (206, 151, 958, 641)
     x1_region, y1_region, x2_region, y2_region = OUTCOME_SEARCH_REGION
@@ -1322,35 +1276,38 @@ def find_halftime_handicap_and_click_new(outcome_str: str, match_name: Optional[
         screenshot = pyautogui.screenshot(region=(x1_region, y1_region, region_width, region_height))
         time.sleep(0.5)
 
-        debug_screenshot_path = f"debug_halftime_handicap_scroll_{scroll_iter+1}.png"
-        screenshot.save(debug_screenshot_path)
-        for chat_id in subscribers:
-            send_photo(chat_id, debug_screenshot_path,
-                         caption=f"HT Handicap Scroll {scroll_iter+1} for: {outcome_str}")
+        # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+        if DEBUG_SCREENSHOT:
+            debug_screenshot_path = f"debug_halftime_handicap_scroll_{scroll_iter+1}.png"
+            screenshot.save(debug_screenshot_path)
+            for chat_id in subscribers:
+                send_photo(chat_id, debug_screenshot_path,
+                             caption=f"HT Handicap Scroll {scroll_iter+1} for: {outcome_str}")
 
         try:
             full_text, ocr_blocks = get_ocr_results(screenshot)
             if not full_text and not ocr_blocks and scroll_iter < max_scrolls -1 :
                  telegram_log(f"[ERROR][HT_TOTAL] OCR вернул пустые значения. Скролл {scroll_iter+1}. Пропускаем к следующему скроллу.", is_debug_message=True)
-                 pyautogui.scroll(-4) 
-                 time.sleep(1) 
+                 pyautogui.scroll(-4)
+                 time.sleep(1)
                  continue
 
-            ocr_debug_msg = (f"[OCR][HT_HANDICAP][SCROLL {scroll_iter+1}] Ищем: {outcome_str}\\n"
-                           f"Parsed: Half='{half_identifier_search}', Team='{team_name_search}', Handicap='{handicap_display_search}'\\n"
-                           f"Blocks (first 30):\\n" + "\\n".join([f'{b[1]} @ {b[0]}' for b in ocr_blocks[:30]]))
-            if len(ocr_blocks) > 30:
-                ocr_debug_msg += "\\n..."
+            # --- ИЗМЕНЕНИЕ: Ограничиваем количество блоков для логирования ---
+            ocr_debug_msg = (f"[OCR][HT_HANDICAP][SCROLL {scroll_iter+1}] Ищем: {outcome_str}\n"
+                           f"Parsed: Half='{half_identifier_search}', Team='{team_name_search}', Handicap='{handicap_display_search}'\n"
+                           f"Blocks (first 10): \n" + "\n".join([f'{b[1]} @ {b[0]}' for b in ocr_blocks[:10]]))
+            if len(ocr_blocks) > 10:
+                ocr_debug_msg += "\n..."
             for chat_id in subscribers:
                 send_message(chat_id, ocr_debug_msg[:4000])
         except Exception as e_ocr_section:
             telegram_log(f"[ERROR][HT_HANDICAP] Исключение во время OCR или отправки OCR лога для скролла {scroll_iter+1}: {e_ocr_section}", is_debug_message=True)
             import traceback
             tb_str = traceback.format_exc()
-            telegram_log(f"[TRACEBACK_OCR_HT_HANDICAP]:\\n{tb_str[:3500]}", is_debug_message=True)
+            telegram_log(f"[TRACEBACK_OCR_HT_HANDICAP]:\n{tb_str[:3500]}", is_debug_message=True)
             if scroll_iter < max_scrolls -1 :
-                pyautogui.scroll(-4) 
-                time.sleep(1) 
+                pyautogui.scroll(-4)
+                time.sleep(1)
                 continue
             else:
                 telegram_log(f"[FAIL][HT_HANDICAP] Ошибка OCR на последнем скролле. Прерывание поиска для {outcome_str}.", is_debug_message=True)
@@ -1392,22 +1349,23 @@ def find_halftime_handicap_and_click_new(outcome_str: str, match_name: Optional[
              y_after_active_half_indicator = active_half_section_indicator_block[0][2][1]
         else:
              telegram_log(f"[HT_HANDICAP_NEW] Не удалось определить начальную Y координату секции. Скролл {scroll_iter+1}.", is_debug_message=True)
-             pyautogui.scroll(-4) 
-             time.sleep(1) 
+             pyautogui.scroll(-4)
+             time.sleep(1)
              continue
 
         potential_handicap_blocks = []
         for idx, block in enumerate(ocr_blocks):
             if block[0][0][1] >= y_after_active_half_indicator:
-                block_text_no_space = block[1].replace(" ", "")
-                handicap_search_no_space = handicap_display_search.replace(" ", "")
-                if handicap_search_no_space in block_text_no_space:
+                # Use the strict flexible patterns defined globally
+                block_text_cleaned_for_match = block[1].lower().replace(' ', '').replace(',', '.').replace('—', '-')
+                if re.fullmatch(create_flexible_pattern(handicap_display_search), block_text_cleaned_for_match) or \
+                   re.fullmatch(create_flexible_pattern(handicap_display_search.replace('(', '').replace(')', '')), block_text_cleaned_for_match):
                     potential_handicap_blocks.append({"block": block, "idx": idx, "y": block[0][0][1]})
 
         if not potential_handicap_blocks:
             telegram_log(f"[HT_HANDICAP_NEW] Блоки с форой '{handicap_display_search}' не найдены ниже Y={y_after_active_half_indicator}. Скролл {scroll_iter+1}.", is_debug_message=True)
-            pyautogui.scroll(-4) 
-            time.sleep(1) 
+            pyautogui.scroll(-4)
+            time.sleep(1)
             continue
 
         potential_handicap_blocks.sort(key=lambda item: item["y"])
@@ -1420,72 +1378,86 @@ def find_halftime_handicap_and_click_new(outcome_str: str, match_name: Optional[
 
             if team_name_search:
                 team_found_for_this_handicap = False
-                for i_team_check in range(idx_handicap_block - 1, max(-1, idx_handicap_block - 5), -1):
-                    if i_team_check < 0: 
-                        break
-                    check_block_team = ocr_blocks[i_team_check]
+                # Search upwards for the team name in the entire OCR block list (not just before current block)
+                for i_team_check, check_block_team in enumerate(ocr_blocks):
                     y_check_block_team = check_block_team[0][0][1]
-                    if abs(y_check_block_team - y_handicap_block) < Y_TOLERANCE_LINE + 10:
-                        if team_name_search.lower() in check_block_team[1].lower():
-                            team_found_for_this_handicap = True
-                            telegram_log(f"[HT_HANDICAP_NEW] Команда '{team_name_search}' найдена ('{check_block_team[1]}') рядом с форой '{block_handicap_display[1]}'", is_debug_message=True)
-                            break
-                if not team_found_for_this_handicap:
-                    telegram_log(f"[HT_HANDICAP_NEW] Команда '{team_name_search}' НЕ найдена для форы '{block_handicap_display[1]}'. Пропускаем эту фору.", is_debug_message=True)
-                    continue
+                    x_check_block_team_min = check_block_team[0][0][0]
+                    x_check_block_team_max = check_block_team[0][1][0]
+                    
+                    # Check if block is significantly above and within column X-range
+                    if y_check_block_team < y_handicap_block - TEAM_COLUMN_SEARCH_Y_DIFF and \
+                       x_check_block_team_min - TEAM_COLUMN_X_TOLERANCE <= (x_handicap_block + block_width/2) <= x_check_block_team_max + TEAM_COLUMN_X_TOLERANCE:
+                        
+                        if is_fuzzy_match(team_name_search, check_block_team[1]):
+                            # Exclude blocks that are pure numbers
+                            if not re.fullmatch(r'^\d+(\.\d+)?$', check_block_team[1].strip().replace(',', '.')):
+                                team_found_for_this_handicap = True
+                                telegram_log(f"[HT_HANDICAP_NEW] Команда '{team_name_search}' найдена ('{check_block_team[1]}') как заголовок столбца для форы '{block_handicap_display[1]}'.", is_debug_message=True)
+                                break
+                            else:
+                                telegram_log(f"[HT_HANDICAP_NEW] Блок '{check_block_team[1]}' является числом, а не именем команды. Пропускаем.", is_debug_message=True)
+                        else:
+                            telegram_log(f"[HT_HANDICAP_NEW] Блок '{check_block_team[1]}' находится в колонке, но не соответствует команде '{team_name_search}'.", is_debug_message=True)
+                # If we've passed the Y-range where headers might be, stop searching.
+                elif y_check_block_team > y_handicap_block: # We're below the handicap block, no headers here.
+                    break
+
+                # No need to check for i_team_check >= idx_handicap_block, as we are iterating from beginning
+                # and checking y_check_block_team < y_handicap_block already filters out blocks below/on the same line.
+
+            if not team_found_for_this_handicap:
+                telegram_log(f"[HT_HANDICAP_NEW] Команда '{team_name_search}' НЕ найдена как заголовок столбца для форы '{block_handicap_display[1]}'. Пропускаем эту форы.", is_debug_message=True)
+                continue # Try next potential handicap block
 
             text_in_handicap_block = block_handicap_display[1].replace(" ", "")
             handicap_text_no_space = handicap_display_search.replace(" ", "")
 
-            handicap_end_pos = -1
-            match_display_str_pos = text_in_handicap_block.find(handicap_text_no_space)
-            if match_display_str_pos != -1:
-                handicap_end_pos = match_display_str_pos + len(handicap_text_no_space)
-            elif re.match(r'^\(?[-+]?' + re.escape(handicap_text_no_space.replace('(', '').replace(')', '')) + r'\)?$', text_in_handicap_block):
-                match_value_str_pos = text_in_handicap_block.find(handicap_text_no_space.replace('(', '').replace(')', ''))
-                if match_value_str_pos != -1:
-                    handicap_end_pos = match_value_str_pos + len(handicap_text_no_space.replace('(', '').replace(')', '')) # ИСПРАВЛЕНИЕ: опечатка handacap
-                    if handicap_end_pos < len(text_in_handicap_block) and handicap_end_pos < len(text_in_handicap_block) and block_text_normalized[handicap_end_pos] == ')':
-                        handicap_end_pos += 1
-
-            if handicap_end_pos != -1:
-                remaining_text_in_block = text_in_handicap_block[handicap_end_pos:].strip()
-                coef_match_inline = re.match(r'^\s*([0-9]+(?:\.[0-9]+)?)$', remaining_text_in_block.replace(",", "."))
+            # If the block contains the handicap string and potentially the coefficient (inline)
+            # Use re.search instead of re.fullmatch and extract coefficient from the rest of the string
+            # Also, add an escaped version of handicap_display_str in case of Tesseract adding spaces inside.
+            handicap_pattern_in_block = re.search(create_flexible_pattern(handicap_display_search), text_in_handicap_block)
+            
+            if handicap_pattern_in_block:
+                remaining_text_after_handicap = text_in_handicap_block[handicap_pattern_in_block.end():].strip()
+                coef_match_inline = re.match(r'^\d+(?:\.\d+)?$', remaining_text_after_handicap.replace(',', '.'))
+                
                 if coef_match_inline:
-                    coef_value = coef_match_inline.group(1)
-                    telegram_log(f"[HT_HANDICAP_NEW] Коэффициент '{coef_value}' найден ВНУТРИ блока с форой: '{block_handicap_display[1]}'", is_debug_message=True)
-                    abs_click_x = x_handicap_block + x1_region
-                    abs_click_y = y_handicap_block + y1_region
-                    pyautogui.click(abs_click_x, abs_click_y)
-                    telegram_log(f"[КЛИК][HT_HANDICAP_NEW] Клик по '{block_handicap_display[1]}' на ({abs_click_x}, {abs_click_y}) (коэф. inline)")
+                    coef_text = coef_match_inline.group(0) # Use group(0) for the whole match
+                    block_center_x = x_block_handicap_display + block_width / 2
+                    block_center_y = y_block_handicap_display + block_height / 2
+
+                    pyautogui.click(int(block_center_x) + region_offset_x, int(block_center_y) + region_offset_y)
+                    telegram_log(f"[КЛИК][HT_HANDICAP_NEW] Кликнута фора '{block_handicap_display[1]}' со встроенным коэф. '{coef_text}' по ({int(block_center_x) + region_offset_x}, {int(block_center_y) + region_offset_y}).", is_debug_message=True)
+                    time.sleep(0.5)
                     return True
 
-            if block_handicap_display[1].strip().startswith(handicap_display_search):
-                telegram_log(f"[HT_HANDICAP_NEW][SCROLL][DEBUG] Найден блок с форой, начинающийся с {handicap_display_search}: '{block_handicap_display[1].strip()}'")
-                found_coef = False
-                checked_blocks = []
-                for offset in range(1, 8):
-                    idx_coef = idx_handicap_block + offset
-                    if idx_coef >= len(ocr_blocks): 
-                        break
-                    next_block = ocr_blocks[idx_coef]
-                    checked_blocks.append(next_block[1])
-                    coef_match = re.search(r'\d+(?:\.\d+)?', next_block[1])
-                    if coef_match:
-                        abs_click_x = next_block[0][0][0] + x1_region
-                        abs_click_y = next_block[0][0][1] + y1_region
-                        if (abs_click_x, abs_click_y) == (0, 0):
-                            telegram_log(f"[HT_HANDICAP_NEW][SCROLL][ERROR] Координаты для клика равны (0, 0) — клик не совершен!")
-                        else:
-                            pyautogui.click(abs_click_x, abs_click_y)
-                            telegram_log(f"[КЛИК][HT_HANDICAP_NEW] Клик по исходу: {team_name_search} {handicap_display_search} по абсолютным координатам {abs_click_x}, {abs_click_y} (коэффициент в следующем блоке #{idx_coef})")
-                            return True
-                        found_coef = True
-                if not found_coef:
-                    telegram_log(f"[HT_HANDICAP_NEW][SCROLL] Блок с форой {handicap_display_search} найден (начинается с {handim_display_search}), но кэф не найден ни в этом, ни в следующих 7 блоках. Просмотренные блоки: {checked_blocks}")
-        telegram_log(f"[HT_HANDICAP_NEW][SCROLL] Исход не найден на текущем экране (скролл {scroll_iter+1}).", is_debug_message=True)
-        pyautogui.scroll(-4)
-        time.sleep(1)
+            # If not inline, look for the coefficient in adjacent blocks
+            telegram_log(f"[HT_HANDICAP_NEW][DEBUG] Ищем соседний коэффициент для блока: '{block_handicap_display[1]}'.", is_debug_message=True)
+            found_coef_adjacent = False
+            for j in range(idx_handicap_block + 1, len(ocr_blocks)):
+                next_block = ocr_blocks[j]
+                x_next_block, y_next_block = next_block[0][0][0], next_block[0][0][1]
+
+                if abs(y_next_block - y_handicap_block) < Y_LINE_TOLERANCE_COEF and \
+                   x_next_block > x_handicap_block and \
+                   (x_next_block - (x_handicap_block + block_width)) < X_COEF_SEARCH_RANGE:
+
+                    if re.match(r'^\d+(?:\.\d+)?$', next_block[1].replace(',', '.')):
+                        coef_block_width = next_block[0][1][0] - next_block[0][0][0]
+                        coef_block_height = next_block[0][2][1] - next_block[0][0][1]
+
+                        coef_block_center_x = x_next_block + coef_block_width / 2
+                        coef_block_center_y = y_next_block + coef_block_height / 2
+
+                        pyautogui.click(int(coef_block_center_x) + region_offset_x, int(coef_block_center_y) + region_offset_y)
+                        telegram_log(f"[КЛИК][HT_HANDICAP_NEW] Кликнута фора '{block_handicap_display[1]}' с соседним коэф. '{next_block[1]}' по ({int(coef_block_center_x) + region_offset_x}, {int(coef_block_center_y) + region_offset_y}).", is_debug_message=True)
+                        time.sleep(0.5)
+                        return True
+                    # else: # Removed this debug log for less verbosity
+                elif y_next_block - y_handicap_block > Y_LINE_TOLERANCE_COEF * 2:
+                    break # Not on the same logical line anymore
+                elif x_next_block - (x_handicap_block + block_width) > X_COEF_SEARCH_RANGE:
+                    break # Too far horizontally
 
     telegram_log(f"[HT_HANDICAP_NEW][FAIL] Не удалось найти исход: {outcome_str} после {max_scrolls} скроллов.", is_debug_message=True)
     return False
@@ -1497,9 +1469,9 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
         "X": (543, 570),
         "2": (606, 570)
     }
-    OUTCOME_SEARCH_REGION = (206, 151, 958, 641)
-    FINISH_COORDS = (1160, 597)
-    RETRY_COORDS = (1254, 363)
+    OUTCOME_SEARCH_REGION = (206, 151, 958, 641) # Global search region for OCR
+    FINISH_COORDS = (1160, 597) # Assuming this is still correct for "Place Bet" button
+    RETRY_COORDS = (1254, 363) # Assuming this is still correct for a "clear bet" or "retry" button
 
     outcome_successfully_clicked = False
 
@@ -1535,27 +1507,30 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
             outcome_successfully_clicked = True
         else:
             telegram_log(f"[ERROR] Halftime handicap исход '{outcome}' не найден или не обработан!")
-    elif "тайм" in outcome.lower() and "тотал" in outcome.lower():
-        telegram_log(f"Обнаружен исход halftime total: '{outcome}'. Использую find_halftime_total_and_click_new.", is_debug_message=True)
-        if find_halftime_total_and_click_new(outcome):
-            time.sleep(2)
-            outcome_successfully_clicked = True
-        else:
-            telegram_log(f"[ERROR] Halftime total исход '{outcome}' не найден!")
-    elif "тотал голов (" in outcome.lower():
-        telegram_log(f"Обнаружен исход team total: '{outcome}'. Использую find_total_and_click_coef_team_new.", is_debug_message=True)
-        if find_total_and_click_coef_team_new(outcome):
-            time.sleep(2)
-            outcome_successfully_clicked = True
-        else:
-            telegram_log("[ERROR] Тотал по команде не найден!")
-    elif "тотал" in outcome.lower():
-        telegram_log(f"Обнаружен общий исход total: '{outcome}'. Использую find_total_and_click_coef_new.", is_debug_message=True)
-        if find_total_and_click_coef_new(outcome):
-            time.sleep(2)
-            outcome_successfully_clicked = True
-        else:
-            telegram_log("[ERROR] Тотал не найден!")
+    # TODO: Implement find_halftime_total_and_click_new
+    # elif "тайм" in outcome.lower() and "тотал" in outcome.lower():
+    #     telegram_log(f"Обнаружен исход halftime total: '{outcome}'. Использую find_halftime_total_and_click_new.", is_debug_message=True)
+    #     if find_halftime_total_and_click_new(outcome):
+    #         time.sleep(2)
+    #         outcome_successfully_clicked = True
+    #     else:
+    #         telegram_log(f"[ERROR] Halftime total исход '{outcome}' не найден!")
+    # TODO: Implement find_total_and_click_coef_team_new
+    # elif "тотал голов (" in outcome.lower():
+    #     telegram_log(f"Обнаружен исход team total: '{outcome}'. Использую find_total_and_click_coef_team_new.", is_debug_message=True)
+    #     if find_total_and_click_coef_team_new(outcome):
+    #         time.sleep(2)
+    #         outcome_successfully_clicked = True
+    #     else:
+    #         telegram_log("[ERROR] Тотал по команде не найден!")
+    # TODO: Implement find_total_and_click_coef_new
+    # elif "тотал" in outcome.lower():
+    #     telegram_log(f"Обнаружен общий исход total: '{outcome}'. Использую find_total_and_click_coef_new.", is_debug_message=True)
+    #     if find_total_and_click_coef_new(outcome):
+    #         time.sleep(2)
+    #         outcome_successfully_clicked = True
+    #     else:
+    #         telegram_log("[ERROR] Тотал не найден!")
     elif ("фора" in outcome.lower() or "победа с учетом форы" in outcome.lower()):
         telegram_log(f"[HYBRID_FOR] Использую гибридный режим (Mistral+Tesseract) для исхода: '{outcome}'", is_debug_message=True)
         search_text = outcome.strip()
@@ -1574,7 +1549,7 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
             match_name=match_name
         )
         if found_coords is not None:
-            if found_coords == (0, 0):
+            if found_coords == (0, 0): # This case might occur if some previous logic wrongly sets 0,0 for "already clicked"
                 telegram_log(f"[DEBUG] Клик по исходу уже был совершен, пропускаю повторный клик.", is_debug_message=True)
             else:
                 telegram_log(f"[DEBUG] Исход '{outcome}' найден по координатам: {found_coords}", is_debug_message=True)
@@ -1627,10 +1602,12 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
 
     try:
         screenshot_coef = pyautogui.screenshot(region=final_coef_region)
-        debug_coef_path = "debug_coef_screenshot.png"
-        screenshot_coef.save(debug_coef_path)
-        for chat_id in subscribers:
-            send_photo(chat_id, debug_coef_path, caption=f"Финальный скрин коэффициента (область {final_coef_region})")
+        # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+        if DEBUG_SCREENSHOT:
+            debug_coef_path = "debug_coef_screenshot.png"
+            screenshot_coef.save(debug_coef_path)
+            for chat_id in subscribers:
+                send_photo(chat_id, debug_coef_path, caption=f"Финальный скрин коэффициента (область {final_coef_region})")
     except Exception as e:
         telegram_log(f"[ERROR] Ошибка при создании скриншота коэффициента: {e}")
         pyautogui.scroll(300)
@@ -1742,12 +1719,14 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
             confirmation_screenshot_region = (398, 336, 835 - 398, 494 - 336)
             telegram_log(f"[DEBUG] Делаем подтверждающий скриншот области {confirmation_screenshot_region}...", is_debug_message=True)
             try:
-                conf_ss = pyautogui.screenshot(region=confirmation_screenshot_region)
-                conf_ss_path = "bet_final_confirmation_screenshot.png"
-                conf_ss.save(conf_ss_path)
-                telegram_log(f"[DEBUG] Подтверждающий скриншот сохранен: {conf_ss_path}", is_debug_message=True)
-                for chat_id in subscribers:
-                    send_photo(chat_id, conf_ss_path, caption="Пари принято (подтверждающий скриншот)")
+                # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой ---
+                if DEBUG_SCREENSHOT:
+                    conf_ss = pyautogui.screenshot(region=confirmation_screenshot_region)
+                    conf_ss_path = "bet_final_confirmation_screenshot.png"
+                    conf_ss.save(conf_ss_path)
+                    telegram_log(f"[DEBUG] Подтверждающий скриншот сохранен: {conf_ss_path}", is_debug_message=True)
+                    for chat_id in subscribers:
+                        send_photo(chat_id, conf_ss_path, caption="Пари принято (подтверждающий скриншот)")
 
                 telegram_log("[DEBUG] Клик по кнопке закрытия окна подтверждения (549, 422).", is_debug_message=True)
                 pyautogui.click(549, 422)
@@ -1842,16 +1821,7 @@ def find_outcome(match_name: str, outcome: str, coef_condition: str, bet_amount:
         time.sleep(3)
         return False
 
-def finalize_bet_and_navigate():
-    """Выполняет клики для завершения ставки и навигации/очистки купона."""
-    telegram_log("[NAVIGATE] Запуск finalize_bet_and_navigate...")
-
-    time.sleep(1)
-    home_coords = (70, 142)
-    telegram_log(f"[NAVIGATE] Попытка клика по координатам возврата домой: {home_coords}")
-    pyautogui.click(home_coords[0], home_coords[1])
-    telegram_log("[NAVIGATE] Возврат на главную страницу (клик выполнен)...")
-    telegram_log("[NAVIGATE] Завершающие клики выполнены.")
+# Removed finalize_bet_and_navigate as its logic is now embedded in find_outcome's success path.
 
 def send_instructions():
     """
@@ -1877,6 +1847,8 @@ def send_instructions():
 `Barcelona - Real Madrid, 1, >1.5, 100`
 `Juventus - Milan, Тотал больше 2.5, >1.8, 50`
 `Liverpool - Arsenal, X, 3.2, 75`
+`Команда А - Команда Б, Фора Команда А (-1.5), >1.9, 100`
+`Команда В - Команда Г, Таймы Фора 1-й тайм Команда В (+0.5), <2.1, 50`
 
 ⚠️ *Важно:*
 - Разделяйте параметры запятыми
@@ -1886,7 +1858,7 @@ def send_instructions():
     for chat_id in subscribers:
         send_message(chat_id, instructions)
 
-def parse_total_outcome_new(outcome, ocr_blocks):
+def parse_total_outcome_new(outcome, _): # Removed unused ocr_blocks argument
     """
     Парсит исход для тотала:
     - Извлекает значение тотала
@@ -1911,363 +1883,12 @@ def parse_total_outcome_new(outcome, ocr_blocks):
 
     return base_type, total_value
 
-def find_total_outcome_table_new(outcome, ocr_blocks):
-    """
-    Поиск исхода с тоталом в табличной структуре:
-    1. Находит нужный тотал (например, 2.5)
-    2. Определяет тип (больше/меньше)
-    3. Ищет соответствующий коэффициент
-    4. Кликает по найденному коэффициенту
-    Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота.
-    """
-    Y_TOLERANCE = 15
-    Y_DOWN_TOLERANCE = 25
-
-    base_type, total_value = parse_total_outcome_new(outcome, ocr_blocks)
-    if not base_type or not total_value:
-        return False
-
-    total_str = f"({total_value})"
-
-    for block_total in ocr_blocks:
-        if total_str in block_total[1]:
-            x_total = block_total[0][0][0]
-            y_total = block_total[0][0][1]
-
-            for block_coef in ocr_blocks:
-                x_coef = block_coef[0][0][0]
-                y_coef = block_coef[0][0][1]
-
-                if abs(y_coef - y_total) < Y_TOLERANCE:
-                    if base_type == "меньше" and x_coef < x_total:
-                        if re.match(r'^\d+(?:\.\d+)?', block_coef[1].replace(',', '.')):
-                            pyautogui.click(x_coef + globals()["OUTCOME_SEARCH_REGION"][0], y_coef + globals()["OUTCOME_SEARCH_REGION"][1])
-                            telegram_log(f"[TOTAL_TABLE_NEW] Клик по исходу: тотал {total_str} {base_type} по координатам {x_coef}, {y_coef}")
-                            return True
-                    elif base_type == "больше" and x_coef > x_total:
-                        if re.match(r'^\d+(?:\.\d+)?', block_coef[1].replace(',', '.')):
-                            pyautogui.click(x_coef + globals()["OUTCOME_SEARCH_REGION"][0], y_coef + globals()["OUTCOME_SEARCH_REGION"][1])
-                            telegram_log(f"[TOTAL_TABLE_NEW] Клик по исходу: тотал {total_str} {base_type} по координатам {x_coef}, {y_coef}")
-                            return True
-
-            for block_coef in ocr_blocks:
-                x_coef = block_coef[0][0][0]
-                y_coef = block_coef[0][0][1]
-
-                if y_coef > y_total and y_coef - y_total < Y_DOWN_TOLERANCE:
-                    if base_type == "меньше" and x_coef < x_total:
-                        if re.match(r'\d+(?:\.\d+)?', block_coef[1].replace(',', '.')):
-                            pyautogui.click(x_coef + globals()["OUTCOME_SEARCH_REGION"][0], y_coef + globals()["OUTCOME_SEARCH_REGION"][1])
-                            telegram_log(f"[TOTAL_TABLE_NEW] Клик по исходу: тотал {total_str} {base_type} по координатам {x_coef}, {y_coef} (ниже)")
-                            return True
-                    elif base_type == "больше" and x_coef > x_total:
-                        if re.match(r'\d+(?:\.\d+)?', block_coef[1].replace(',', '.')):
-                            pyautogui.click(x_coef + globals()["OUTCOME_SEARCH_REGION"][0], y_coef + globals()["OUTCOME_SEARCH_REGION"][1])
-                            telegram_log(f"[TOTAL_TABLE_NEW] Клик по исходу: тотал {total_str} {base_type} по координатам {x_coef}, {y_coef} (ниже)")
-                            return True
-
-    telegram_log(f"[TOTAL_TABLE_NEW] Не найден коэффициент для тотала {total_str} {base_type}")
-    return False
-
-def find_total_coef_candidates_new(total_block, ocr_blocks, base_type, x1_region, y1_region):
-    """
-    Ищет все числовые блоки-коэффициенты рядом с блоком тотала.
-    Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота.
-    """
-    total_x = total_block[0][0][0]
-    total_y = total_block[0][0][1]
-    Y_RADIUS = 30
-    candidates = []
-    for coef_block in ocr_blocks:
-        coef_x = coef_block[0][0][0]
-        coef_y = coef_block[0][0][1]
-        if abs(coef_y - total_y) < Y_RADIUS and re.match(r'^\d+(?:\.\d+)?$', coef_block[1].replace(',', '.')):
-            dx = abs(coef_x - total_x)
-            candidates.append((coef_block, coef_x, coef_y, dx))
-    candidates.sort(key=lambda c: c[3])
-    if candidates:
-        msg = '[TOTAL_NEW][FLEX] Найдены кандидаты коэффициентов рядом с тоталом: '
-        msg += ', '.join([f"{c[0][1]}@({c[1]},{c[2]})" for c in candidates])
-        telegram_log(msg)
-    return candidates
-
-def find_total_and_click_coef_new(outcome, max_scrolls=7):
-    base_type, total_value = parse_total_outcome_new(outcome, [])
-    if not base_type or not total_value:
-        telegram_log(f"[TOTAL_NEW] Не удалось распарсить исход: {outcome}")
-        return False
-
-    total_str = f"({total_value})"
-    telegram_log(f"[TOTAL_NEW] Ищем тотал: {total_str}, тип: {base_type}")
-
-    OUTCOME_SEARCH_REGION = (206, 151, 958, 641)
-    x1, y1, x2, y2 = OUTCOME_SEARCH_REGION
-    region_width = x2 - x1
-    region_height = y2 - y1
-
-    for scroll_iter in range(max_scrolls):
-        screenshot = pyautogui.screenshot(region=(x1, y1, region_width, region_height))
-        time.sleep(1)
-        debug_total_path = f"debug_total_scroll_{scroll_iter+1}.png"
-        screenshot.save(debug_total_path)
-        total_blocks = []
-        full_text, ocr_blocks = get_ocr_results(screenshot)
-        for idx, block in enumerate(ocr_blocks):
-            if block[1].strip() == total_value.replace('.', '') and idx > 0 and ocr_blocks[idx - 1][1] == '(' and idx + 1 < len(ocr_blocks) and ocr_blocks[idx + 1][1] == ')':
-                total_blocks.append(block)
-            elif total_str in block[1]:
-                total_blocks.append(block)
-
-        candidates_list_for_diag = []
-        found_any = False
-        for total_block in total_blocks:
-            coef_inline_match = re.search(r'\b\d+(?:\.\d+)?\b', total_block[1].replace(total_str, ''))
-            if coef_inline_match:
-                found_any = True
-                candidates_list_for_diag.append(f"{coef_inline_match.group(0)} (inline)")
-
-            coef_candidates = find_total_coef_candidates_new(total_block, ocr_blocks, base_type, x1, y1)
-            if coef_candidates:
-                candidates_list_for_diag.extend([f"{c[0][1]}@({c[1]},{c[2]})" for c in coef_candidates])
-                found_any = True
-
-        send_ocr_diagnostics_telegram(
-            scroll_iter,
-            "total",
-            f"Ищу тотал: {total_str} {base_type}",
-            debug_total_path,
-            full_text,
-            ocr_blocks,
-            candidates=candidates_list_for_diag,
-            found=found_any
-        )
-        if find_total_outcome_table_new(outcome, ocr_blocks):
-            return True
-
-        pyautogui.scroll(-4)
-        time.sleep(1)
-
-    telegram_log(f"[TOTAL_NEW] Не удалось найти исход: {outcome} после {max_scrolls} скроллов.")
-    return False
-
-def parse_total_team_from_outcome_new(outcome: str) -> Optional[str]:
-    """
-    Извлекает имя команды из исхода тотала, если указано в скобках: "Тотал голов (Лечче) Меньше (1.0)"
-    Возвращает имя команды или None.
-    """
-    m = re.search(r'Тотал голов \(([^)]+)\)', outcome, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
-
-def find_total_and_click_coef_team_new(outcome, max_scrolls=7):
-    """
-    Поиск и клик по исходу тотала для конкретной команды.
-    Координаты ocr_blocks уже масштабированы обратно к исходному размеру скриншота.
-    """
-    team = parse_total_team_from_outcome_new(outcome)
-    base_type, total_value = parse_total_outcome_new(outcome, [])
-    if not base_type or not total_value or not team:
-        telegram_log(f"[TOTAL_TEAM_NEW] Не удалось распарсить исход или команду: {outcome}")
-        return False
-
-    total_str = f"({total_value})"
-    telegram_log(f"[TOTAL_TEAM_NEW] Ищем тотал: {total_str}, тип: {base_type}, команда: {team}", is_debug_message=True)
-
-    Y_TOLERANCE_HEADER_SEQUENCE = 20
-    Y_GAP_FOR_NEXT_SECTION = 40
-    X_COL_ALIGN_TOLERANCE = 70
-    Y_TOLERANCE_TOTAL_COEF = 20
-
-    OUTCOME_SEARCH_REGION = (206, 151, 958, 641)
-    x1_region, y1_region, _, _ = OUTCOME_SEARCH_REGION
-    region_width = OUTCOME_SEARCH_REGION[2] - OUTCOME_SEARCH_REGION[0]
-    region_height = OUTCOME_SEARCH_REGION[3] - OUTCOME_SEARCH_REGION[1]
-
-    for scroll_iter in range(max_scrolls):
-        screenshot = pyautogui.screenshot(region=(x1_region, y1_region, region_width, region_height))
-        time.sleep(1)
-        debug_total_path = f"debug_total_team_scroll_{scroll_iter+1}.png"
-        screenshot.save(debug_total_path)
-        for chat_id in subscribers:
-            send_photo(chat_id, debug_total_path, caption=f"Скриншот поиска тотала по команде {team}, скролл {scroll_iter+1}")
-
-        full_text, ocr_blocks = get_ocr_results(screenshot)
-        ocr_debug_msg = f"[OCR][TOTAL_TEAM][SCROLL {scroll_iter+1}]\nКоманда: {team}, Тотал: {total_str} {base_type}\nFull text:\n{full_text}\nBlocks:\n" + "\n".join([str(r) for r in ocr_blocks])
-        for chat_id in subscribers:
-            send_message(chat_id, ocr_debug_msg[:4000])
-
-        section_content_blocks = []
-        header_found = False
-        header_avg_y = -1
-
-        for i in range(len(ocr_blocks) - 1):
-            b_total = ocr_blocks[i]
-            # Fix Ruff E713: Test for membership should be `not in`
-            if "тотал" not in b_total[1].lower():
-                continue
-
-            idx_after_total = i
-            b_lparen = None
-            idx_after_lparen = -1
-            header_prefix_blocks = [b_total]
-
-            if idx_after_total + 1 < len(ocr_blocks):
-                b_next_after_total = ocr_blocks[idx_after_total + 1]
-                if "голов" in b_next_after_total[1].lower():
-                    header_prefix_blocks.append(b_next_after_total)
-                    if idx_after_total + 2 < len(ocr_blocks) and ocr_blocks[idx_after_total + 2][1] == '(':
-                        b_lparen = ocr_blocks[idx_after_total + 2]
-                        idx_after_lparen = idx_after_total + 2
-                        header_prefix_blocks.append(b_lparen)
-                    else: 
-                        continue
-                elif b_next_after_total[1] == '(':
-                    b_lparen = b_next_after_total
-                    idx_after_lparen = idx_after_total + 1
-                    header_prefix_blocks.append(b_lparen)
-                else: 
-                    continue
-            else: 
-                continue
-
-            if not b_lparen: 
-                continue
-
-            y_coords_prefix_check = [b_check[0][0][1] for b_check in header_prefix_blocks]
-            if max(y_coords_prefix_check) - min(y_coords_prefix_check) > Y_TOLERANCE_HEADER_SEQUENCE:
-                continue
-
-            current_header_avg_y_calc = sum(y_coords_prefix_check) / len(y_coords_prefix_check)
-
-            for num_team_name_blocks_to_try in range(1, 6):
-                end_idx_for_team_name = idx_after_lparen + num_team_name_blocks_to_try
-                if end_idx_for_team_name >= len(ocr_blocks): 
-                    break
-
-                team_name_candidate_parts = [ocr_blocks[k][1] for k in range(idx_after_lparen + 1, end_idx_for_team_name + 1)]
-                formed_ocr_team_name = " ".join(team_name_candidate_parts)
-
-                all_team_parts_on_line = True
-                for k_team_part in range(idx_after_lparen + 1, end_idx_for_team_name + 1):
-                    y_team_part_block = ocr_blocks[k_team_part][0][0][1]
-                    if abs(y_team_part_block - current_header_avg_y_calc) > Y_TOLERANCE_HEADER_SEQUENCE:
-                        all_team_parts_on_line = False 
-                        break
-                if not all_team_parts_on_line: 
-                    continue
-
-                team_check_normalized = team.lower().replace('-', '').replace(' ', '')
-                formed_ocr_check_normalized = formed_ocr_team_name.lower().replace('-', '').replace(' ', '')
-
-                if team_check_normalized in formed_ocr_check_normalized:
-                    idx_potential_rparen_check = end_idx_for_team_name + 1
-                    if idx_potential_rparen_check < len(ocr_blocks):
-                        b_rparen_cand_check = ocr_blocks[idx_potential_rparen_check]
-                        y_rparen_cand_check = b_rparen_cand_check[0][0][1]
-                        if b_rparen_cand_check[1] == ')' and abs(y_rparen_cand_check - current_header_avg_y_calc) < Y_TOLERANCE_HEADER_SEQUENCE:
-                            header_found = True
-                            header_avg_y = current_header_avg_y_calc
-                            content_start_actual_idx = idx_potential_rparen_check + 1
-
-                            section_end_determine_idx = len(ocr_blocks)
-                            for k_sec_end in range(content_start_actual_idx, len(ocr_blocks)):
-                                k_block_text_lower_sec_end = ocr_blocks[k_sec_end][1].lower()
-                                k_block_y_min_sec_end = ocr_blocks[k_sec_end][0][0][1]
-                                is_another_team_total = "тотал голов (" in k_block_text_lower_sec_end and team.lower() not in k_block_text_lower_sec_end
-                                is_general_totals_header = ("тотал" == k_block_text_lower_sec_end.strip() or "тоталы" == k_block_text_lower_sec_end.strip())
-                                if (is_another_team_total or (is_general_totals_header and k_block_y_min_sec_end > header_avg_y + Y_GAP_FOR_NEXT_SECTION)):
-                                    section_end_determine_idx = k_sec_end 
-                                    break
-
-                            section_content_blocks = ocr_blocks[content_start_actual_idx : section_end_determine_idx]
-                            telegram_log(f"[TOTAL_TEAM_NEW] Найдена секция для '{team}' (Y ~{header_avg_y:.0f}). Bлоков контента: {len(section_content_blocks)}")
-                            break
-            if header_found: 
-                break
-
-        if not header_found or not section_content_blocks:
-            if not header_found: 
-                telegram_log(f"[TOTAL_TEAM_NEW][SCROLL] Заголовок секции для '{team}' не найден (итерация {scroll_iter+1}).")
-            elif not section_content_blocks: 
-                telegram_log(f"[TOTAL_TEAM_NEW][SCROLL] Секция '{team}' найдена, но пуста (итерация {scroll_iter+1}).")
-            pyautogui.scroll(-4) 
-            time.sleep(1) 
-            continue
-
-        ocr_section_debug = f"[OCR][TOTAL_TEAM_SECTION] Bloки для секции '{team}' (после заголовка):\n" + "\n".join([str(r) for r in section_content_blocks])
-        for chat_id in subscribers: 
-            send_message(chat_id, ocr_section_debug[:4000])
-
-        column_header_block = None
-        for block_in_section_content in section_content_blocks:
-            if base_type.lower() == block_in_section_content[1].strip().lower():
-                column_header_block = block_in_section_content
-                telegram_log(f"[TOTAL_TEAM_NEW] B секции {team} найден заголовок колонки: '{column_header_block[1]}'")
-                break
-
-        col_x_start_val = x1_region
-        min_y_for_outcome_search = header_avg_y
-        if column_header_block:
-            col_x_start_val = column_header_block[0][0][0]
-            col_x_end_val = column_header_block[0][1][0]
-            min_y_for_outcome_search = column_header_block[0][2][1]
-        else:
-            telegram_log(f"[TOTAL_TEAM_NEW] Заголовок колонки '{base_type}' не найден в секции {team}. Поиск будет шире.")
-
-
-        found_outcome_and_clicked = False
-        for idx_in_section_content, current_block in enumerate(section_content_blocks):
-            if current_block[0][0][1] <= min_y_for_outcome_search:
-                continue
-
-            block_x_center = (current_block[0][0][0] + current_block[0][1][0]) / 2
-            if not (col_x_start_val - X_COL_ALIGN_TOLERANCE < block_x_center < col_x_end_val + X_COL_ALIGN_TOLERANCE):
-                continue
-
-            current_block_text_stripped = current_block[1].replace(',', '.')
-
-            regex_target_total_escaped = re.escape(total_str)
-            match_combined = re.search(rf"^{regex_target_total_escaped}\s*(\d+\.\d+)$", current_block_text_stripped)
-            if match_combined:
-                coef_text = match_combined.group(1)
-                telegram_log(f"[DEBUG] Логика А: Найден комб. блок '{current_block[1]}' (коэф: {coef_text}) под колонкой '{base_type}'", is_debug_message=True)
-                abs_click_x = current_block[0][0][0] + x1_region
-                abs_click_y = current_block[0][0][1] + y1_region
-                pyautogui.click(abs_click_x, abs_click_y)
-                telegram_log(f"[КЛИК][А] Клик по halftime total: '{current_block[1]}' по ({abs_click_x}, {abs_click_y})", is_debug_message=True)
-                found_outcome_and_clicked = True
-                break
-
-            if current_block_text_stripped == total_str.replace(' ', ''):
-                for j in range(idx_in_section_content + 1, min(idx_in_section_content + 5, len(section_content_blocks))):
-                    next_block = section_content_blocks[j]
-                    y_next_block = next_block[0][0][1]
-                    if abs(y_next_block - current_block[0][0][1]) < Y_TOLERANCE_TOTAL_COEF:
-                        coef_match = re.match(r"^(\d+(?:\.\d+)?)$", next_block[1].replace(',', '.'))
-                        if coef_match:
-                            coef_text = coef_match.group(1)
-                            telegram_log(f"[DEBUG] Логика Б: Найден блок '{current_block[1]}' и след. коэф. '{coef_text}' под '{base_type}'", is_debug_message=True)
-                            abs_click_x = next_block[0][0][0] + x1_region
-                            abs_click_y = next_block[0][0][1] + y1_region
-                            pyautogui.click(abs_click_x, abs_click_y)
-                            telegram_log(f"[КЛИК][Б] Клик по halftime total: '{current_block[1]}' (коэф: {coef_text}) по ({abs_click_x}, {abs_click_y})", is_debug_message=True)
-                            found_outcome_and_clicked = True
-                            break
-                if found_outcome_and_clicked: 
-                    break
-
-        if found_outcome_and_clicked: 
-            return True
-
-        if not found_outcome_and_clicked:
-            telegram_log(f"Исход '{outcome}' с коэффициентом не найден в секции команды '{team}' (итерация {scroll_iter+1}).", is_debug_message=True)
-            pyautogui.scroll(-4) 
-            time.sleep(1) 
-            continue
-
-    telegram_log(f"[SCROLL_END] Не удалось найти halftime total исход: {outcome} после {max_scrolls} скроллов.", is_debug_message=True)
-    return False
+# find_total_outcome_table_new, find_total_coef_candidates_new,
+# find_total_and_click_coef_new, parse_total_team_from_outcome_new,
+# find_total_and_click_coef_team_new are currently commented out in find_outcome,
+# so their implementations are not critical for this specific fix.
+# They should be reviewed for similar OCR precision issues if uncommented later.
+# For now, keeping them as-is.
 
 def send_ocr_diagnostics_telegram(
     scroll_iter: int,
@@ -2290,12 +1911,14 @@ def send_ocr_diagnostics_telegram(
     - статус (найдено/не найдено)
     """
     header = f"[DIAG][{search_type.upper()}][SCROLL {scroll_iter + 1}] {search_desc}"
-    for chat_id in subscribers:
-        send_photo(chat_id, screenshot_path, caption=header)
-    msg = header + f"\nFull OCR text:\n{full_text}\n\nOCR blocks:\n"
-    msg += "\n".join([str(b) for b in ocr_blocks[:30]])
-    if len(ocr_blocks) > 30:
-        msg += f"\n... (ещё {len(ocr_blocks)-30} блоков)"
+    # --- ИЗМЕНЕНИЕ: Добавляем проверку DEBUG_SCREENSHOT перед отправкой фото ---
+    if DEBUG_SCREENSHOT:
+        for chat_id in subscribers:
+            send_photo(chat_id, screenshot_path, caption=header)
+    msg = header + f"\nFull OCR text:\n{full_text}\n\nOCR blocks (first 10):\n" # --- ИЗМЕНЕНИЕ: Ограничиваем количество блоков ---
+    msg += "\n".join([str(b) for b in ocr_blocks[:10]])
+    if len(ocr_blocks) > 10: # --- ИЗМЕНЕНИЕ: Ограничиваем количество блоков ---
+        msg += f"\n... (ещё {len(ocr_blocks)-10} блоков)"
     if candidates is not None:
         msg += f"\n\nКандидаты: {candidates}"
     if extra:
@@ -2325,70 +1948,71 @@ def find_handicap_hybrid_click_new(search_text: str, match_name: str, max_scroll
             break
 
     # Prepare patterns for matching handicap value from Mistral's output
-    # Get the absolute numeric value (e.g., "1.0" from "-1.0")
+    # (Mistral part is mostly for confirmation, Tesseract for bbox)
     abs_handicap_value_str = str(abs(float(handicap_value_from_input)))
-    abs_handicap_value_escaped = re.escape(abs_handicap_value_str.replace('.', r'\.'))
-
     # Pattern for (X.X) or X.X or -X.X or +X.X allowing optional spaces inside/around
-    # This covers `(-1.0)`, `(1.0)`, `1.0`, `-1.0` as well as variations like `( -1.0 )`
-    loose_handicap_value_pattern = re.compile(
-        r'[\(\s]*[-+]?\s*' + abs_handicap_value_escaped + r'\s*[\)\s]*'
+    loose_handicap_value_pattern_mistral = re.compile(
+        r'[\(\s]*[-+]?\s*' + re.escape(abs_handicap_value_str.replace('.', r'\.')) + r'\s*[\)\s]*'
     )
-    # Also consider the exact display string provided, but normalized for matching against cleaned Mistral output
-    handicap_display_normalized_for_search = handicap_display_from_input.lower().replace(" ", "").replace(",", ".")
+    handicap_display_normalized_for_search_mistral = handicap_display_from_input.lower().replace(" ", "").replace(",", ".")
 
     for scroll_iter in range(max_scrolls):
         telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Делаем скриншот и выполняем OCR.", is_debug_message=True)
-        current_screenshot = pyautogui.screenshot(region=(x1_region, y1_region, region_width, region_height))
+        current_full_screenshot = pyautogui.screenshot(region=(x1_region, y1_region, region_width, region_height))
 
-        debug_path = f"debug_hybrid_handicap_scroll_{scroll_iter+1}.png"
-        current_screenshot.save(debug_path)
-        for chat_id in subscribers:
-            send_photo(chat_id, debug_path, caption=f"Поиск форы гибридным методом: Скролл {scroll_iter+1} для {search_text}")
-
-        full_text_mistral, _ = extract_text_mistral_ocr(current_screenshot)
+        # --- Mistral OCR for broad check and section finding ---
+        full_text_mistral, _ = extract_text_mistral_ocr(current_full_screenshot)
         full_text_mistral_lower = full_text_mistral.lower()
-
-        # Clean Mistral's output string for matching
         full_text_mistral_cleaned_for_match = full_text_mistral_lower.replace(" ", "").replace(",", ".").replace("—", "-")
 
-
         handicap_type_present_mistral = "форы" in full_text_mistral_cleaned_for_match or \
-                                        "победасучетомфоры" in full_text_mistral_cleaned_for_match
+                                        "победасучетомфоры" in full_text_mistral_cleaned_for_match or \
+                                        "гандикап" in full_text_mistral_cleaned_for_match or \
+                                        "handicap" in full_text_mistral_cleaned_for_match
 
-        # Check for handicap value presence using both the exact display string (normalized)
-        # and the more flexible regex pattern for the numerical value.
         handicap_value_present_mistral = \
-            handicap_display_normalized_for_search in full_text_mistral_cleaned_for_match or \
-            loose_handicap_value_pattern.search(full_text_mistral_cleaned_for_match) is not None
+            handicap_display_normalized_for_search_mistral in full_text_mistral_cleaned_for_match or \
+            loose_handicap_value_pattern_mistral.search(full_text_mistral_cleaned_for_match) is not None
 
         team_present_mistral = False
         team_name_for_mistral_check = "Н/Д"
         if team_name_target:
-            if is_fuzzy_match(team_name_target, full_text_mistral_lower): # Using original lower text for fuzzy match
+            if is_fuzzy_match(team_name_target, full_text_mistral_lower):
                 team_present_mistral = True
                 team_name_for_mistral_check = team_name_target
 
         telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Результат Mistral OCR: Тип форы: {handicap_type_present_mistral}, Команда: {team_present_mistral} ('{team_name_for_mistral_check}'), Значение форы: {handicap_value_present_mistral} ('{handicap_display_from_input}').", is_debug_message=True)
 
-        # Условие для запуска Tesseract: Mistral должен подтвердить наличие значения форы,
-        # тип форы, и команды (если указана).
+        # Condition for running Tesseract: Mistral must broadly confirm the presence.
         if handicap_value_present_mistral and (not team_name_target or team_present_mistral) and handicap_type_present_mistral:
-            telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Конкретное значение форы '{handicap_display_from_input}' найдено Mistral OCR (и проверка команды/типа пройдена). Переходим к Tesseract для точных координат.", is_debug_message=True)
+            telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Mistral conditions met. Preparing Tesseract for precise coordinates.", is_debug_message=True)
 
-            full_text_tesseract, tesseract_blocks = extract_text_tesseract(current_screenshot, **BEST_TESSERACT_PARAMS)
+            # --- ИЗМЕНЕНИЕ: Временно отключаем обрезку по заголовку для отладки таблиц ---
+            # Run Tesseract on the *full* current screenshot
+            full_text_tesseract, tesseract_blocks = extract_text_tesseract(current_full_screenshot, **BEST_TESSERACT_PARAMS)
+            
+            # Since we're not cropping based on header for now, these offsets are just the main region offsets
+            tesseract_region_offset_x = x1_region
+            tesseract_region_offset_y = y1_region
+
+            # --- ИЗМЕНЕНИЕ: Убираем логику обработки found_header_block, т.к. не обрезаем ---
+            # This block is now unused, its logic for cropping is temporarily skipped.
+            # However, we still want to log the "full" tesseract blocks and try to click.
+            # This part will be revisited later if we re-enable smarter cropping.
 
             send_ocr_diagnostics_telegram(
                 scroll_iter,
                 "HYBRID_TESSERACT_BBOX",
                 f"Tesseract BBox for: '{search_text}' (scroll {scroll_iter+1})",
-                debug_path,
+                f"debug_hybrid_handicap_scroll_{scroll_iter+1}.png", # Still reference the full screenshot
                 full_text_tesseract,
-                tesseract_blocks,
+                tesseract_blocks, # Use all blocks for analysis in _click_handicap_from_blocks
                 found=False,
                 extra=f"OCR_PROVIDER: {OCR_PROVIDER}. Match Name: {match_name}. Parsed Team: {team_name_target}. Parsed Handicap: {handicap_display_from_input}"
             )
-            if _click_handicap_from_blocks(search_text, tesseract_blocks, team_name_target, x1_region, y1_region):
+
+            # Now, call the clicking helper with the blocks and the correct offsets
+            if _click_handicap_from_blocks(search_text, tesseract_blocks, team_name_target, tesseract_region_offset_x, tesseract_region_offset_y):
                 telegram_log(f"[HYBRID_FOR][SCROLL {scroll_iter+1}] Исход '{search_text}' успешно найден и кликнут Tesseract'ом.", is_debug_message=True)
                 return True
             else:
